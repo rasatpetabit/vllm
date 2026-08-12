@@ -422,13 +422,15 @@ class ParserEngine(Parser):
             # that declares no tools would inherit the names of the
             # previous one and could recover a tool it never asked for.
             self._engine.allowed_tool_names = None
-        if not self.skip_tool_parsing and not self._suppress_tool_calls:
-            tool_choice = getattr(request, "tool_choice", None)
-            if tool_choice == "none" and tools:
-                self._suppress_tool_calls = True
-        # The engine needs the suppression state too: recovery
-        # transitions must not consume text that will never be allowed
-        # to become a tool call.
+        # Derived fresh for every request.  The engine is reused across
+        # requests, so latching this would let one request's suppression
+        # leak into every later one.  A request that declares no tools at
+        # all cannot produce a tool call either, so it suppresses too.
+        tool_choice = getattr(request, "tool_choice", None)
+        self._suppress_tool_calls = not tools or tool_choice == "none"
+        # The engine needs the suppression state too: tool transitions
+        # must not consume text that will never be allowed to become a
+        # tool call.
         self._engine.suppress_tool_calls = self._suppress_tool_calls
 
     def _strip_content_whitespace(
@@ -513,6 +515,10 @@ class ParserEngine(Parser):
         model_output: str,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
+        # Like every other entry point: whether this request can produce a
+        # tool call decides whether tool markup is control flow or just
+        # text the model wrote inside its reasoning.
+        self._check_skip_tool_parsing(request)
         self._reset()
         events = self._feed(model_output, [])
         events.extend(self._engine.finish())
