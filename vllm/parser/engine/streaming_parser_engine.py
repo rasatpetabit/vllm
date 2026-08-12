@@ -163,11 +163,12 @@ class StreamingParserEngine:
         # set per request by the owning ParserEngine, like
         # ``skip_tool_parsing`` it survives reset().
         self.allowed_tool_names: frozenset[str] | None = None
-        # True when the request asked for tool_choice "none".  Recovery
-        # transitions are skipped while set, so text that looks like a
-        # recovered tool call stays plain content instead of being
-        # consumed and then suppressed.  Set per request by the owning
-        # ParserEngine; survives reset() like ``skip_tool_parsing``.
+        # True when the request can never yield a tool call: tool_choice
+        # "none", or no tools declared at all.  Tool transitions are
+        # skipped while set, so text that looks like a tool call stays
+        # plain content instead of being consumed and then suppressed.
+        # Set per request by the owning ParserEngine; survives reset()
+        # like ``skip_tool_parsing``.
         self.suppress_tool_calls = False
         self.reset(initial_state=initial_state)
 
@@ -352,7 +353,9 @@ class StreamingParserEngine:
                 return events
             return self._emit_for_state(value)
 
-        if self.skip_tool_parsing and terminal in self._tool_terminals:
+        if (
+            self.skip_tool_parsing or self.suppress_tool_calls
+        ) and terminal in self._tool_terminals:
             if self.state == ParserState.MESSAGE_HEADER:
                 self.state = ParserState.CONTENT
                 self._message_header_buffer = ""
@@ -363,7 +366,16 @@ class StreamingParserEngine:
                         tool_index=self.tool_index,
                     )
                 ]
-            if EventType.REASONING_END in transition.events:
+            # Reasoning ends here only when a tool call is actually
+            # possible — the terminal then marks the real end of thinking.
+            # When the request can never yield one the terminal is just
+            # text the model wrote, often while narrating DSML syntax
+            # inside <think>, so reasoning has to continue.  Ending it
+            # would flush the rest of the thoughts into the content.
+            if (
+                not self.suppress_tool_calls
+                and EventType.REASONING_END in transition.events
+            ):
                 self.state = ParserState.CONTENT
                 return [
                     SemanticEvent(
