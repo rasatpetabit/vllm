@@ -320,13 +320,26 @@ def collect_required_tool_params(
     for tool in tools:
         if isinstance(tool, (FunctionTool, NamespaceTool)):
             for name, params in iter_response_function_tool_info(tool):
-                required[name] = frozenset((params or {}).get("required", ()))
+                required[name] = _required_param_names(params)
             continue
         if not _is_function_tool(tool):
             continue
         name, params = _extract_tool_info(tool)
-        required[name] = frozenset((params or {}).get("required", ()))
+        required[name] = _required_param_names(params)
     return required
+
+
+def _required_param_names(params: dict | None) -> frozenset[str]:
+    """A schema's "required" is only trusted when it is a list of names.
+
+    Request models accept arbitrary schema dictionaries, so "required" may
+    be null, a string, or garbage; anything but a list of strings means no
+    checkable requirements.
+    """
+    needed = (params or {}).get("required")
+    if not isinstance(needed, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(n for n in needed if isinstance(n, str))
 
 
 def find_tool_name(
