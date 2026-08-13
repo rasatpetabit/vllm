@@ -29,6 +29,7 @@ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserSt
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
+    collect_required_tool_params,
     collect_tool_names,
     extract_types_from_schema,
     find_tool_name,
@@ -416,12 +417,16 @@ class ParserEngine(Parser):
         if tools:
             self._tools = tools
             self._engine.allowed_tool_names = self._declared_tool_names()
+            self._engine.required_tool_params = collect_required_tool_params(
+                tools
+            )
         else:
             # The engine is reused across requests and reset() keeps this
             # field, so it has to be cleared here.  Otherwise a request
             # that declares no tools would inherit the names of the
             # previous one and could recover a tool it never asked for.
             self._engine.allowed_tool_names = None
+            self._engine.required_tool_params = None
         # Derived fresh for every request.  The engine is reused across
         # requests, so latching this would let one request's suppression
         # leak into every later one.  A request that declares no tools at
