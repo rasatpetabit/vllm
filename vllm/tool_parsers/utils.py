@@ -337,9 +337,11 @@ def _required_param_names(params: dict | None) -> frozenset[str]:
     checkable requirements.
     """
     needed = (params or {}).get("required")
-    if not isinstance(needed, (list, tuple, set, frozenset)):
+    if not isinstance(needed, list):
         return frozenset()
-    return frozenset(n for n in needed if isinstance(n, str))
+    if not all(isinstance(n, str) for n in needed):
+        return frozenset()
+    return frozenset(needed)
 
 
 def find_tool_name(

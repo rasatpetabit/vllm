@@ -591,7 +591,7 @@ class StreamingParserEngine:
                 converter(raw_args, False) if converter is not None
                 else raw_args
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             return False
         return isinstance(provided, dict) and needed <= provided.keys()
 
