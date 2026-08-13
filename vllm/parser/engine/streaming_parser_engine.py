@@ -571,6 +571,8 @@ class StreamingParserEngine:
 
         A tool that requires nothing stays ambiguous by construction and
         is accepted, as is the case where the request's schema is unknown.
+        An engine without an arg_converter emits argument chunks that are
+        already JSON, so the gate checks them directly.
         """
         required = self.required_tool_params
         if not required:
@@ -579,15 +581,16 @@ class StreamingParserEngine:
         if not needed:
             return True
         converter = self.config.arg_converter
-        if converter is None:
-            return True
         raw_args = "".join(
             e.value
             for e in self._held_events
             if e.type is EventType.ARG_VALUE_CHUNK
         )
         try:
-            provided = json.loads(converter(raw_args, False))
+            provided = json.loads(
+                converter(raw_args, False) if converter is not None
+                else raw_args
+            )
         except (TypeError, ValueError):
             return False
         return isinstance(provided, dict) and needed <= provided.keys()
