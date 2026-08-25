@@ -199,7 +199,11 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.mtp_draft_probs import require_mtp_draft_probs
+from vllm.v1.spec_decode.mtp_draft_probs import (
+    collect_draft_prob_rows,
+    compact_uncovered_drafts,
+    require_mtp_draft_probs,
+)
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -3717,6 +3721,7 @@ class GPUModelRunner(
             self.speculative_config,
             sampling_metadata,
             draft_probs,
+            spec_decode_metadata.num_draft_tokens,
         )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -4987,31 +4992,29 @@ class GPUModelRunner(
     def _get_spec_decode_draft_probs(
         self, spec_decode_metadata: SpecDecodeMetadata
     ) -> torch.Tensor | None:
-        if self._draft_probs is None or self._draft_prob_req_ids is None:
+        compact_uncovered_drafts(
+            spec_decode_metadata,
+            self.input_batch.req_ids,
+            self._draft_prob_req_ids,
+            rows_available=self._draft_probs is not None,
+        )
+        cached = self._draft_probs
+        row_at = None if cached is None else (lambda idx, n: cached[idx, :n])
+        rows, skipped = collect_draft_prob_rows(
+            self.input_batch.req_ids,
+            spec_decode_metadata.num_draft_tokens,
+            self._draft_prob_req_ids,
+            row_at,
+        )
+        if skipped:
+            logger.warning(
+                "Missing cached draft probabilities for requests %s; "
+                "skipping speculative tokens for those requests.",
+                skipped,
+            )
+        if not rows:
             return None
-
-        row_by_req_id = {
-            req_id: idx for idx, req_id in enumerate(self._draft_prob_req_ids)
-        }
-        draft_probs_rows: list[torch.Tensor] = []
-        for req_id, num_draft in zip(
-            self.input_batch.req_ids, spec_decode_metadata.num_draft_tokens
-        ):
-            if num_draft == 0:
-                continue
-            row_idx = row_by_req_id.get(req_id)
-            if row_idx is None:
-                logger.warning(
-                    "Missing cached draft probabilities for request %s; "
-                    "falling back to legacy speculative rejection behavior.",
-                    req_id,
-                )
-                return None
-            draft_probs_rows.append(self._draft_probs[row_idx, :num_draft])
-
-        if not draft_probs_rows:
-            return None
-        return torch.cat(draft_probs_rows, dim=0).contiguous()
+        return torch.cat(rows, dim=0).contiguous()
 
     def propose_draft_token_ids(
         self,

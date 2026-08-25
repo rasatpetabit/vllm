@@ -36,11 +36,11 @@ def test_missing_probs_never_reach_rejection_sampler_fallback():
     speculative = SimpleNamespace(method="mtp", draft_sample_method="probabilistic")
     sampling = SimpleNamespace(all_greedy=False)
     with pytest.raises(RuntimeError, match="draft probability rows"):
-        require_mtp_draft_probs(speculative, sampling, None)
+        require_mtp_draft_probs(speculative, sampling, None, [2])
 
 
 def test_sample_path_calls_require_mtp_draft_probs():
     text = RUNNER.read_text(encoding="utf-8")
-    assert "from vllm.v1.spec_decode.mtp_draft_probs import require_mtp_draft_probs" in text
+    assert "collect_draft_prob_rows" in text
     assert "require_mtp_draft_probs(" in text
     assert "self.speculative_config" in text
