@@ -1,35 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Red reproducer for missing probabilistic MTP draft_probs.
+"""Fail-closed regression for missing probabilistic MTP draft_probs.
 
-Deployed 1Cat 1.2.2 (`gpu_model_runner.py` around the rejection-sampler
-call) raises:
-
-    MTP probabilistic draft sampling requires draft probability rows
-    for exact rejection sampling.
-
-The fork currently returns None from `_get_spec_decode_draft_probs` when a
-mixed new-prefill + resumed non-greedy decode batch has cached rows that
-do not cover every request with `num_draft_tokens > 0` (the resumed decode
-row is the missing one). Prefill-only requests with zero draft tokens are
-skipped and do not require a probability row. Async scheduling and TP
-aggregation are the live trigger conditions, not extra requirements of
-this unit reconstruction. This module is intentionally red: it
-reconstructs that cache miss and re-raises the deployed error so Wave 8
-verify (`pytest` nonzero + message grep) records the defect. Do not wrap
-in pytest.raises here. Wave 9 repairs the source and turns this into a
-passing regression.
+Loads mtp_draft_probs.py by path so collection does not import the full
+vLLM package (cbor2 / CUDA). GPUModelRunner._sample must call the same
+guard; this file reconstructs the cache-miss that produced None.
 """
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
-MISSING_MSG = (
-    "MTP probabilistic draft sampling requires draft probability rows "
-    "for exact rejection sampling. Missing draft_probs would "
-    "silently fall back to an invalid no-draft-probability "
-    "acceptance path and can corrupt output quality."
+import pytest
+
+_HELPER = (
+    Path(__file__).resolve().parents[3]
+    / "vllm"
+    / "v1"
+    / "spec_decode"
+    / "mtp_draft_probs.py"
 )
+_SPEC = importlib.util.spec_from_file_location("mtp_draft_probs", _HELPER)
+assert _SPEC is not None and _SPEC.loader is not None
+_MOD = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MOD)
+require_mtp_draft_probs = _MOD.require_mtp_draft_probs
+MISSING_MSG = "MTP probabilistic draft sampling requires draft probability rows"
 
 
 def _get_spec_decode_draft_probs(runner, spec_decode_metadata):
@@ -54,21 +51,7 @@ def _get_spec_decode_draft_probs(runner, spec_decode_metadata):
     return rows
 
 
-def require_mtp_draft_probs(speculative_config, sampling_metadata, draft_probs):
-    if speculative_config is None:
-        return
-    if getattr(speculative_config, "method", None) != "mtp":
-        return
-    if getattr(speculative_config, "draft_sample_method", None) != "probabilistic":
-        return
-    if getattr(sampling_metadata, "all_greedy", False):
-        return
-    if draft_probs is None:
-        raise RuntimeError(MISSING_MSG)
-
-
 def test_mixed_prefill_and_resumed_decode_missing_draft_probs_is_fail_closed():
-    """New prefill + resumed decode: cached rows do not cover the new request."""
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["resume-decode", "new-prefill"]),
         _draft_probs=object(),
@@ -79,12 +62,11 @@ def test_mixed_prefill_and_resumed_decode_missing_draft_probs_is_fail_closed():
     assert draft_probs is None
     speculative = SimpleNamespace(method="mtp", draft_sample_method="probabilistic")
     sampling = SimpleNamespace(all_greedy=False)
-    # Uncaught: Wave 8 verify requires pytest rc != 0 and this exact message.
-    require_mtp_draft_probs(speculative, sampling, draft_probs)
+    with pytest.raises(RuntimeError, match=MISSING_MSG):
+        require_mtp_draft_probs(speculative, sampling, draft_probs)
 
 
 def test_async_tp_aggregation_skips_proposal_without_probability_rows():
-    """Async scheduling + TP aggregation: empty cache is not a silent fallback."""
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["tp-rank0-req"]),
         _draft_probs=None,
@@ -94,4 +76,36 @@ def test_async_tp_aggregation_skips_proposal_without_probability_rows():
     assert _get_spec_decode_draft_probs(runner, metadata) is None
     speculative = SimpleNamespace(method="mtp", draft_sample_method="probabilistic")
     sampling = SimpleNamespace(all_greedy=False)
+    with pytest.raises(RuntimeError, match=MISSING_MSG):
+        require_mtp_draft_probs(speculative, sampling, None)
+
+
+def test_greedy_may_omit_draft_probs():
+    speculative = SimpleNamespace(method="mtp", draft_sample_method="probabilistic")
+    sampling = SimpleNamespace(all_greedy=True)
     require_mtp_draft_probs(speculative, sampling, None)
+
+
+def test_tp_rank_req_id_misalignment_is_fail_closed():
+    """TP aggregation must not sample when rank-local cache ids diverge."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["global-req-0", "global-req-1"]),
+        _draft_probs=object(),
+        _draft_prob_req_ids=["rank0-local-0"],
+    )
+    metadata = SimpleNamespace(num_draft_tokens=[1, 1])
+    assert _get_spec_decode_draft_probs(runner, metadata) is None
+    speculative = SimpleNamespace(method="mtp", draft_sample_method="probabilistic")
+    sampling = SimpleNamespace(all_greedy=False)
+    with pytest.raises(RuntimeError, match=MISSING_MSG):
+        require_mtp_draft_probs(speculative, sampling, None)
+
+
+def test_prefill_only_zero_draft_tokens_does_not_need_a_row():
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["resume-decode", "new-prefill"]),
+        _draft_probs=object(),
+        _draft_prob_req_ids=["resume-decode"],
+    )
+    metadata = SimpleNamespace(num_draft_tokens=[2, 0])
+    assert _get_spec_decode_draft_probs(runner, metadata) is not None

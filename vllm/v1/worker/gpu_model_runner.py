@@ -199,6 +199,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.mtp_draft_probs import require_mtp_draft_probs
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -3712,6 +3713,11 @@ class GPUModelRunner(
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+        require_mtp_draft_probs(
+            self.speculative_config,
+            sampling_metadata,
+            draft_probs,
+        )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
