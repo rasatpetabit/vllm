@@ -29,6 +29,7 @@ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserSt
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
+    collect_tool_names,
     extract_types_from_schema,
     find_tool_name,
     find_tool_properties,
@@ -107,6 +108,7 @@ class ParserEngine(Parser):
         self._engine = StreamingParserEngine(
             parser_engine_config, tokenizer, vocab=self.vocab
         )
+        self._engine.allowed_tool_names = self._declared_tool_names()
 
         self._has_reasoning = (
             "THINK_END" in parser_engine_config.token_id_terminals
@@ -147,11 +149,6 @@ class ParserEngine(Parser):
             self._reasoning_start_token_id = vocab.get(start_text)
         if end_text:
             self._reasoning_end_token_id = vocab.get(end_text)
-        self._turn_boundary_token_ids: frozenset[int] = frozenset(
-            token_id
-            for token in parser_engine_config.turn_boundary_tokens
-            if (token_id := vocab.get(token)) is not None
-        )
 
     @property
     def reasoning_start_str(self) -> str | None:
@@ -406,6 +403,11 @@ class ParserEngine(Parser):
 
     # ── Private helpers ─────────────────────────────────────────────
 
+    def _declared_tool_names(self) -> frozenset[str] | None:
+        if not self._tools:
+            return None
+        return collect_tool_names(self._tools) or None
+
     def _check_skip_tool_parsing(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -413,10 +415,21 @@ class ParserEngine(Parser):
         tools = getattr(request, "tools", None)
         if tools:
             self._tools = tools
+            self._engine.allowed_tool_names = self._declared_tool_names()
+        else:
+            # The engine is reused across requests and reset() keeps this
+            # field, so it has to be cleared here.  Otherwise a request
+            # that declares no tools would inherit the names of the
+            # previous one and could recover a tool it never asked for.
+            self._engine.allowed_tool_names = None
         if not self.skip_tool_parsing and not self._suppress_tool_calls:
             tool_choice = getattr(request, "tool_choice", None)
             if tool_choice == "none" and tools:
                 self._suppress_tool_calls = True
+        # The engine needs the suppression state too: recovery
+        # transitions must not consume text that will never be allowed
+        # to become a tool call.
+        self._engine.suppress_tool_calls = self._suppress_tool_calls
 
     def _strip_content_whitespace(
         self,
@@ -606,17 +619,11 @@ class ParserEngine(Parser):
         if end_id is not None:
             if not input_ids:
                 return self.parser_engine_config.initial_state != ParserState.REASONING
-            boundary_ids = self._turn_boundary_token_ids
             for i in range(len(input_ids) - 1, -1, -1):
-                token_id = input_ids[i]
-                if token_id == end_id:
+                if input_ids[i] == end_id:
                     return True
-                if start_id is not None and token_id == start_id:
+                if start_id is not None and input_ids[i] == start_id:
                     return False
-                if token_id in boundary_ids:
-                    return (
-                        self.parser_engine_config.initial_state != ParserState.REASONING
-                    )
             return False
         return self._reasoning_ended
 
@@ -636,8 +643,23 @@ class ParserEngine(Parser):
         return None
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
-        """Return reasoning tokens observed by the parser engine so far."""
-        return self._engine.reasoning_token_count
+        start_id = self._reasoning_start_token_id
+        end_id = self._reasoning_end_token_id
+        if start_id is None or end_id is None:
+            return 0
+        count = 0
+        depth = 0
+        for token_id in token_ids:
+            if token_id == start_id:
+                depth += 1
+                continue
+            if token_id == end_id:
+                if depth > 0:
+                    depth -= 1
+                continue
+            if depth > 0:
+                count += 1
+        return count
 
     # ── Single-pass parse helper ────────────────────────────────────────
 
