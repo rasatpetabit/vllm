@@ -278,6 +278,16 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     returns is the one instantiated below. CPU selection proof remains in
     ``test_ampere_selection_real_sm80_sm90_cpu``; this test is the real
     execution proof on an actual SM8x device.
+
+    Order-independence (round 5): this test mutates process-global state — the
+    ModelRegistry entry for ``DeepseekV4ForCausalLM`` and the distributed /
+    model-parallel environment. Both are restored in ``finally``: the prior
+    registry entry is snapshotted before registering (and restored, or removed
+    if it did not exist), and ``cleanup_dist_env_and_memory()`` tears down the
+    distributed + model-parallel state via the project's canonical teardown
+    (``destroy_model_parallel`` + ``destroy_distributed_environment`` + memory
+    cleanup, idempotent when never initialized). The test leaves the process
+    as it found it on an A100 host.
     """
     from vllm.model_executor.models.registry import ModelRegistry
 
@@ -288,7 +298,14 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     # this SM8x device the driver is live, so no tl stub is installed.
     from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
 
-    ModelRegistry.register_model("DeepseekV4ForCausalLM", DeepseekV4ForCausalLM)
+    # Snapshot the prior registry state for this architecture (a lazy
+    # _LazyRegisteredModel under normal conditions) so we can restore it in
+    # the finally -- the test must leave the process as it found it.
+    _ARCH = "DeepseekV4ForCausalLM"
+    _registry = ModelRegistry.models
+    had_prior = _ARCH in _registry
+    prior = _registry.get(_ARCH)
+    ModelRegistry.register_model(_ARCH, DeepseekV4ForCausalLM)
 
     vc, cfg_tmpdir = _make_dsv4_vllm_config()
     try:
@@ -296,7 +313,21 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     finally:
         import shutil
 
+        from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
         shutil.rmtree(cfg_tmpdir, ignore_errors=True)
+        # Tear down the distributed + model-parallel state initialized inside
+        # _run_ampere_decode so a subsequent test starts from a clean process
+        # (order-independence on an A100 host). cleanup_dist_env_and_memory is
+        # the project's canonical teardown: destroy_model_parallel +
+        # destroy_distributed_environment + cache/memory cleanup, and it is
+        # idempotent when the environment was never initialized.
+        cleanup_dist_env_and_memory()
+        # Restore the prior registry entry (or remove the key we added).
+        if had_prior:
+            _registry[_ARCH] = prior
+        else:
+            _registry.pop(_ARCH, None)
 
 
 def _run_ampere_decode(vc) -> None:
