@@ -109,7 +109,7 @@ def _restore_cpu_stubs() -> None:
     _STUB_TL_STATE = None
 
 
-_install_cpu_stubs()  # collection-time bootstrap; restores below
+_STUBS_INSTALLED = _install_cpu_stubs()  # collection-time bootstrap; restores below
 try:
     # The two sparse backend modules call ``tl.constexpr`` at module scope;
     # with Triton disabled (no GPU driver) that raises. Import them under the
@@ -119,7 +119,14 @@ try:
     import vllm.v1.attention.backends.mla.flashmla_sparse  # noqa: E402,F401
     import vllm.v1.attention.backends.mla.triton_mla_sparse  # noqa: E402,F401
 finally:
-    _restore_cpu_stubs()
+    # Restore ONLY when stubs were actually installed. On a CUDA platform
+    # _install_cpu_stubs() returns False and never snapshots the globals
+    # (_STUB_TL_STATE stays at its module-level None); running the restore
+    # unconditionally would then clobber vllm.triton_utils.tl to None and
+    # break every later tl.constexpr module import in the same pytest
+    # process (incident 2026-08-31 wave-5 G-build, first real-GPU run).
+    if _STUBS_INSTALLED:
+        _restore_cpu_stubs()
 
 
 from tests.v1.attention.test_mla_backends import (  # noqa: E402
@@ -2374,3 +2381,41 @@ def test_task12_stub_path_never_runs_on_cuda():
             assert not hasattr(_tu, "tl") or not isinstance(
                 _tu.tl, _types.SimpleNamespace
             ), "stub tl must never be installed on CUDA"
+
+
+def test_task12_cuda_restore_never_clobbers_tl():
+    """Regression: the CUDA-gated bootstrap pair must leave the real globals
+    byte-identical.
+
+    Incident 2026-08-31 (wave-5 G-build, first real-GPU run): on a CUDA
+    platform ``_install_cpu_stubs()`` returns False WITHOUT snapshotting the
+    globals, and the collection-time ``finally: _restore_cpu_stubs()`` then
+    wrote the module-level initial ``_STUB_TL_STATE = None`` into
+    ``vllm.triton_utils.tl``. Every later module-scope ``tl.constexpr``
+    import in the same pytest process failed with
+    ``AttributeError: 'NoneType' object has no attribute 'constexpr'``. The
+    bootstrap now gates the restore on an actual install
+    (``_STUBS_INSTALLED``); this test re-runs the gated pair with a mocked
+    CUDA platform and asserts nothing changed.
+    """
+    from unittest import mock
+
+    from vllm.platforms import current_platform
+
+    before = _snapshot_actual_globals()
+    with mock.patch.object(current_platform, "is_cuda", return_value=True):
+        installed = _install_cpu_stubs()
+    assert installed is False
+    # The bootstrap's guarded shape: restore runs only when stubs were
+    # installed. Emulate it exactly; with no install it must be skipped.
+    if installed:
+        _restore_cpu_stubs()
+    _assert_globals_unchanged(before, _snapshot_actual_globals())
+
+    # And document the hazard the guard prevents: on a CUDA-gated run the
+    # snapshot globals were never captured, so an UNGUARDED restore would
+    # clobber. _STUB_TL_STATE must still be the uncaptured initial (None),
+    # never the _ABSENT sentinel -- the guard key is the installed flag, not
+    # the state value.
+    assert _STUB_TL_STATE is None
+    assert _STUB_TL_STATE is not _ABSENT
