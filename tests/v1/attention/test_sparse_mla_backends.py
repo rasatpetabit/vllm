@@ -1961,6 +1961,36 @@ def _sparse_selection(
     return [b.backend for b in valid], invalid, cfg
 
 
+# NOTE: every caller of _sparse_selection must take the
+# ``selection_vllm_config`` fixture. On hosts where flashinfer is importable
+# (e.g. the campaign image), get_valid_backends reaches
+# FlashInferMLABackend.supports_combination, which calls
+# get_current_vllm_config() and raises AssertionError outside a
+# set_current_vllm_config context (incident 2026-08-31 wave-5 G-build: on the
+# CPU dev host flashinfer is absent, so the path was never reached and the
+# bare tests passed).
+@pytest.fixture()
+def selection_vllm_config():
+    """VllmConfig context for selection probes on accelerated hosts.
+
+    On CUDA platforms it yields inside set_current_vllm_config so
+    backend.validate_configuration/supports_combination can read a config.
+    On CPU-only hosts VllmConfig() itself raises RuntimeError (device type
+    inference fails without an accelerator), and no context is needed there
+    anyway because flashinfer is unimportable and the config-dependent path
+    is never reached."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        yield None
+        return
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    config = VllmConfig()
+    with set_current_vllm_config(config):
+        yield config
+
+
 def _selection_invalid_reason(
     backend: AttentionBackendEnum,
     invalid: dict,
@@ -1971,7 +2001,7 @@ def _selection_invalid_reason(
     return any(substring in r for r in invalid[backend][1])
 
 
-def test_task12_auto_selection_sm80_head512_resolves_triton_sparse():
+def test_task12_auto_selection_sm80_head512_resolves_triton_sparse(selection_vllm_config):
     """glm5next (head_size 512) on sm80 auto-selects TRITON_MLA_SPARSE."""
     valid, invalid, _ = _sparse_selection(DeviceCapability(8, 0), 512)
     assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], valid
@@ -1993,7 +2023,7 @@ def test_task12_auto_selection_sm80_head512_resolves_triton_sparse():
     ), invalid
 
 
-def test_task12_auto_selection_sm80_head576_preserves_dsv4():
+def test_task12_auto_selection_sm80_head576_preserves_dsv4(selection_vllm_config):
     """DSV4 (head_size 576) on sm80 still resolves to TRITON_MLA_SPARSE."""
     valid, invalid, _ = _sparse_selection(DeviceCapability(8, 0), 576)
     assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], valid
@@ -2048,7 +2078,7 @@ def test_task12_backend_priority_order_512_vs_576():
     assert p576[:4] == dense_head
 
 
-def test_task12_forced_triton_sparse_accepted_on_sm80():
+def test_task12_forced_triton_sparse_accepted_on_sm80(selection_vllm_config):
     """Forcing TRITON_MLA_SPARSE on sm80 (512) is accepted (no reasons)."""
     _, _, cfg = _sparse_selection(DeviceCapability(8, 0), 512)
     reasons = AttentionBackendEnum.TRITON_MLA_SPARSE.get_class().validate_configuration(
@@ -2057,7 +2087,7 @@ def test_task12_forced_triton_sparse_accepted_on_sm80():
     assert reasons == [], reasons
 
 
-def test_task12_forced_sm90_sparse_cleanly_rejected_on_sm80():
+def test_task12_forced_sm90_sparse_cleanly_rejected_on_sm80(selection_vllm_config):
     """Forcing FLASHINFER_MLA_SPARSE_SM90 on sm80 is a CLEAN rejection
     (structured reasons), never an exception — the issue-54059 failure class."""
     _, _, cfg = _sparse_selection(DeviceCapability(8, 0), 512)
@@ -2069,7 +2099,7 @@ def test_task12_forced_sm90_sparse_cleanly_rejected_on_sm80():
     assert any("compute capability" in r for r in reasons), reasons
 
 
-def test_task12_forced_flashmla_sparse_rejected_for_head512():
+def test_task12_forced_flashmla_sparse_rejected_for_head512(selection_vllm_config):
     """Forcing FLASHMLA_SPARSE with head_size 512 is rejected on head_size
     (the native kernel only serves 576), regardless of capability."""
     _, _, cfg = _sparse_selection(DeviceCapability(9, 0), 512)
@@ -2081,7 +2111,7 @@ def test_task12_forced_flashmla_sparse_rejected_for_head512():
     assert any("head_size" in r for r in reasons), reasons
 
 
-def test_task12_issue54059_regression_never_raises():
+def test_task12_issue54059_regression_never_raises(selection_vllm_config):
     """Regression for vllm-project/vllm#54059 (sm8x head_size=512 sparse-MLA
     backend-selection failure).
 
@@ -2148,14 +2178,20 @@ def test_task12_cpu_bootstrap_restores_globals():
         name: sys.modules.get(name, _ABSENT) for name in _STUB_MODULE_NAMES
     }
 
-    # Re-run the bootstrap exactly as at collection time, then restore.
+    # Re-run the bootstrap exactly as at collection time (including the
+    # install-guarded restore), then assert restoration.
     installed = _install_cpu_stubs()
     try:
         # Exercise the full import surface the bootstrap protects.
         import vllm.v1.attention.backends.mla.flashinfer_mla_sparse  # noqa: F401
         import vllm.v1.attention.backends.mla.flashmla_sparse  # noqa: F401
     finally:
-        _restore_cpu_stubs()
+        # Guarded exactly like the module bootstrap: on a CUDA platform
+        # nothing was installed, so nothing may be restored (an unguarded
+        # restore would clobber vllm.triton_utils.tl to the uncaptured
+        # _STUB_TL_STATE).
+        if installed:
+            _restore_cpu_stubs()
 
     # Identity assertions on the ACTUAL globals: the exact same objects (or
     # the same absence) must be back in place.
@@ -2367,15 +2403,18 @@ def test_task12_stub_path_never_runs_on_cuda():
         _assert_globals_unchanged(before, _snapshot_actual_globals())
     else:
         # Real CUDA host: the stub path must simply never have installed, so
-        # the actual modules must not be stub modules and tl must be the real
-        # triton.tl (absent or present as the real object).
+        # the real compiled extensions (or absence) must occupy those names.
+        # The bootstrap stub is a bare types.ModuleType with no __file__; a
+        # real extension loads from a .so and always has one. Identity-by-name
+        # is NOT a stub signal on CUDA: the real modules legitimately sit in
+        # sys.modules under their own names.
         assert _install_cpu_stubs() is False
         for name in _STUB_MODULE_NAMES:
             entry = sys.modules.get(name, _ABSENT)
-            assert entry is _ABSENT or not isinstance(
-                entry, _types.ModuleType
-            ) or entry.__name__ != name, (
-                f"stub module {name!r} must never be installed on CUDA"
+            if entry is _ABSENT or not isinstance(entry, _types.ModuleType):
+                continue
+            assert getattr(entry, "__file__", None), (
+                f"bootstrap stub installed on CUDA: {name!r} has no __file__"
             )
         if _tu is not None:
             assert not hasattr(_tu, "tl") or not isinstance(
