@@ -144,6 +144,13 @@ def _get_backend_priorities(
             # (head_size 512, NoPE): the FlashInfer sm90 kernel and FlashMLA
             # sparse reject sm80, so without it the sparse tail would be empty
             # on Ampere. Kept last so sm90/sm100 keep their preferred kernels.
+            #
+            # head_size 512 (glm5next): the FlashInfer SM90 NoPE kernel is the
+            # preferred sparse path where available (sm90), so it is inserted
+            # FIRST; on sm80 it is cleanly rejected by compute capability and
+            # selection falls through to TRITON_MLA_SPARSE. head_size 576
+            # (DSV4): the SM90 entry is appended AFTER the reference DSV4 tail
+            # so the DSV4 sparse preference order is unchanged.
             sparse_tail = [
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
