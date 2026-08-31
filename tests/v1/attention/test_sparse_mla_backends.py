@@ -3,10 +3,41 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
+
+# --- CPU bootstrap -------------------------------------------------------
+# On a CPU-only host the native ``_C_stable_libtorch`` extension and the
+# Triton language runtime are unavailable, which would make the module
+# below uncollectable at import time (``fp8_sm80`` calls ``tl.constexpr`` at
+# module scope). The backend-SELECTION logic (auto / forced / issue-54059
+# regression) must run on every host, so on hosts without usable CUDA install
+# minimal stubs for those two module-scope GPU dependencies, then gate every
+# hardware-execution test with ``@cuda_required`` below. On CUDA hosts
+# nothing is installed here and the real extensions load normally.
+import sys as _sys
+import types as _types
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    _sys.modules.setdefault(
+        "vllm._C_stable_libtorch",
+        _types.ModuleType("vllm._C_stable_libtorch"),
+    )
+    _sys.modules.setdefault(
+        "vllm._moe_C_stable_libtorch",
+        _types.ModuleType("vllm._moe_C_stable_libtorch"),
+    )
+    import vllm.triton_utils as _tu
+
+    _tu.tl = _types.SimpleNamespace(
+        constexpr=lambda v: v,
+        int32=lambda v: v,
+        float32=lambda v: v,
+        int64=lambda v: v,
+    )
+
 
 from tests.v1.attention.test_mla_backends import (
     BATCH_SPECS,
@@ -33,32 +64,47 @@ from vllm.platforms import current_platform
 # TODO: Integrate ROCMAiterMLASparseBackend for ROCm.
 # The ROCm sparse MLA backend (rocm_aiter_mla_sparse.py) has a compatible
 # forward_mqa interface but needs validation on ROCm hardware.
-if not current_platform.is_cuda():
-    pytest.skip(
-        "Sparse MLA backend tests currently only support CUDA. "
-        "ROCm support requires integrating ROCMAiterMLASparseBackend.",
-        allow_module_level=True,
-    )
+cuda_required = pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason=(
+        "Sparse MLA backend hardware-execution tests require CUDA "
+        "(ROCm not yet integrated)."
+    ),
+)
 
-import vllm.v1.attention.backends.mla.flashinfer_mla_sparse as flashinfer_sparse_mod
-from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+
+def _cuda_capability() -> tuple[int, int]:
+    """CUDA compute capability, or (0, 0) on hosts with no usable CUDA.
+
+    Module-scope ``torch.cuda.get_device_capability()`` raises on a CPU-only
+    host, so decorators use this CPU-safe helper instead.
+    """
+    try:
+        return tuple(torch.cuda.get_device_capability())  # type: ignore[return-value]
+    except Exception:
+        return (0, 0)
+
+import vllm.v1.attention.backends.mla.flashinfer_mla_sparse as flashinfer_sparse_mod  # noqa: E402
+from vllm.utils.math_utils import cdiv  # noqa: E402
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (  # noqa: E402
     FlashInferMLASparseImpl,
     FlashInferMLASparseTRTLLMBackend,
-)
-from vllm.v1.attention.backends.mla.flashmla_sparse import (
+)  # noqa: E402
+from vllm.v1.attention.backends.mla.flashmla_sparse import (  # noqa: E402
     FlashMLASparseBackend,
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
     FlashMLASparseMetadataBuilder,
     triton_convert_req_index_to_global_index,
+)  # noqa: E402
+from vllm.v1.attention.backends.mla.indexer import (  # noqa: E402
+    split_indexer_prefill_chunks,
 )
-from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
-from vllm.v1.attention.backends.utils import (
+from vllm.v1.attention.backends.utils import (  # noqa: E402
     split_decodes_and_prefills,
     split_prefill_chunks,
-)
-from vllm.v1.attention.ops import flashmla
+)  # noqa: E402
+from vllm.v1.attention.ops import flashmla  # noqa: E402
 
 SPARSE_BACKEND_BATCH_SPECS = {
     name: BATCH_SPECS[name]
@@ -81,6 +127,7 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 DEVICE_TYPE = current_platform.device_type
 
 
+@cuda_required
 def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
     """Weight absorption must not change the model's attention temperature."""
     model_scale = 256**-0.5
@@ -250,6 +297,7 @@ def _quantize_dequantize_fp8_ds_mla(
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2, 4])
 @pytest.mark.parametrize("block_size", [32, 64])
 @pytest.mark.parametrize(("q_scale", "k_scale"), [(1.0, 1.0), (2.0, 3.0)])
+@cuda_required
 def test_sparse_backend_decode_correctness(
     default_vllm_config,
     dist_init,
@@ -670,7 +718,7 @@ def _triton_convert_reference_impl(
 @pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("num_topk_tokens", [128, 256, 512])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    _cuda_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 def test_triton_convert_req_index_to_global_index_decode_only(
@@ -725,7 +773,7 @@ def test_triton_convert_req_index_to_global_index_decode_only(
 
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    _cuda_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 def test_triton_convert_req_index_to_global_index_with_prefill_workspace(block_size):
@@ -790,7 +838,7 @@ def test_triton_convert_req_index_to_global_index_with_prefill_workspace(block_s
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    _cuda_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 def test_triton_convert_rejects_req_id_longer_than_token_indices():
@@ -845,7 +893,7 @@ def test_triton_convert_rejects_req_id_longer_than_token_indices():
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    _cuda_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 def test_flashmla_forward_bf16_kv_slices_req_id_to_mqa_tokens():
@@ -993,7 +1041,7 @@ PREFILL_BATCH_SPECS = {
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] < 10,
+    _cuda_capability()[0] < 10,
     reason="Sparse MLA forward_mha requires FA4 (SM100+)",
 )
 @pytest.mark.parametrize("batch_name", list(PREFILL_BATCH_SPECS.keys()))
@@ -1349,6 +1397,7 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
 # 384 is not a power of two, so it counts via the tiled atomic accumulation
 # rather than the single-tile path 128 takes.
 @pytest.mark.parametrize("num_topk_tokens", [128, 384])
+@cuda_required
 def test_triton_convert_returns_valid_counts(num_topk_tokens: int):
     """Test that return_valid_counts correctly counts non-negative indices."""
     device = torch.device(DEVICE_TYPE)
@@ -1414,6 +1463,7 @@ def test_triton_convert_returns_valid_counts(num_topk_tokens: int):
         assert torch.all(result[row, num_valid:] == -1)
 
 
+@cuda_required
 def test_flashmla_cache_dtype_aliases_use_ds_layout():
     from vllm.model_executor.layers.attention.mla_attention import (
         _canonicalize_sparse_mla_kv_cache_dtype,
@@ -1428,6 +1478,7 @@ def test_flashmla_cache_dtype_aliases_use_ds_layout():
         )
 
 
+@cuda_required
 def test_flashmla_fp8_metadata_reuses_common_batch_split():
     builder = SimpleNamespace(
         device=torch.device(DEVICE_TYPE),
@@ -1463,6 +1514,7 @@ def test_flashmla_fp8_metadata_reuses_common_batch_split():
     assert fp8_metadata.num_prefill_tokens == 1
 
 
+@cuda_required
 def test_flashmla_common_metadata_requires_uniform_decodes():
     common_metadata = SimpleNamespace(
         max_query_len=3,
@@ -1481,6 +1533,7 @@ def test_flashmla_common_metadata_requires_uniform_decodes():
     assert split == (1, 2, 1, 5)
 
 
+@cuda_required
 def test_flashmla_fp8_metadata_excludes_zero_token_decode_padding(monkeypatch):
     monkeypatch.setattr(
         "vllm.v1.attention.backends.mla.flashmla_sparse.get_mla_metadata",
@@ -1525,6 +1578,7 @@ def test_flashmla_fp8_metadata_excludes_zero_token_decode_padding(monkeypatch):
 
 
 @pytest.mark.parametrize("use_mixed_batch", [False, True])
+@cuda_required
 def test_flashmla_fp8_paths_accept_decode_subset(monkeypatch, use_mixed_batch: bool):
     num_decode_tokens = 2
     num_batch_tokens = 5
@@ -1673,7 +1727,7 @@ def _build_sparse_dcp_vllm_config(
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    _cuda_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 @pytest.mark.parametrize(
@@ -1707,6 +1761,7 @@ def test_fp8_dcp_head_envelope_guard(local_heads, dcp_world_size, should_raise):
         assert local_pad == gathered_pad
 
 
+@cuda_required
 def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):
     """A decode row whose top-k shard holds no local candidates (all -1) has
     undefined kernel out/lse; it must come back as (0, -inf), the identity of
@@ -1766,3 +1821,187 @@ def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):
     assert out.is_contiguous()
     assert not out.isnan().any()
     assert not lse.isnan().any()
+
+
+# ---------------------------------------------------------------------------
+# Task 12 — sm80 backend selection: glm5next (head_size 512) vs DSV4 (576)
+# ---------------------------------------------------------------------------
+# These tests exercise the REAL selection machinery on any host (CPU included):
+# ``CudaPlatformBase.get_valid_backends`` runs each candidate's
+# ``validate_configuration`` and returns (valid list, structured invalid
+# reasons). The only CPU-unavailable pieces are the engine-level
+# ``get_attn_backend_cls`` (it reads the *host* device capability) and the
+# kernel execution paths, both of which are GPU-gated above.
+
+from vllm.platforms.cuda import CudaPlatformBase  # noqa: E402
+from vllm.platforms.interface import DeviceCapability  # noqa: E402
+from vllm.v1.attention.backends.registry import (  # noqa: E402
+    AttentionBackendEnum,
+)
+from vllm.v1.attention.selector import AttentionSelectorConfig  # noqa: E402
+
+
+def _sparse_selection(capability: DeviceCapability, head_size: int, **kw):
+    cfg = AttentionSelectorConfig(
+        head_size=head_size,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=64,
+        use_mla=True,
+        use_sparse=True,
+        **kw,
+    )
+    valid, invalid = CudaPlatformBase.get_valid_backends(
+        capability, cfg, num_heads=32
+    )
+    return [b.backend for b in valid], invalid, cfg
+
+
+def _selection_invalid_reason(
+    backend: AttentionBackendEnum,
+    invalid: dict,
+    substring: str,
+) -> bool:
+    if backend not in invalid:
+        return False
+    return any(substring in r for r in invalid[backend][1])
+
+
+def test_task12_auto_selection_sm80_head512_resolves_triton_sparse():
+    """glm5next (head_size 512) on sm80 auto-selects TRITON_MLA_SPARSE."""
+    valid, invalid, _ = _sparse_selection(DeviceCapability(8, 0), 512)
+    assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], valid
+    # The higher-priority sparse candidates are rejected with STRUCTURED
+    # reasons (the issue-54059 failure class is a crash; these are clean
+    # rejections, never exceptions).
+    assert _selection_invalid_reason(
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+        invalid,
+        "compute capability",
+    ), invalid
+    assert _selection_invalid_reason(
+        AttentionBackendEnum.FLASHMLA_SPARSE, invalid, "head_size"
+    ), invalid
+    assert _selection_invalid_reason(
+        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+        invalid,
+        "compute capability",
+    ), invalid
+
+
+def test_task12_auto_selection_sm80_head576_preserves_dsv4():
+    """DSV4 (head_size 576) on sm80 still resolves to TRITON_MLA_SPARSE."""
+    valid, invalid, _ = _sparse_selection(DeviceCapability(8, 0), 576)
+    assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], valid
+    # FLASHMLA_SPARSE supports 576 but not sm80 -> clean capability rejection,
+    # never a crash.
+    assert _selection_invalid_reason(
+        AttentionBackendEnum.FLASHMLA_SPARSE, invalid, "compute capability"
+    ), invalid
+
+
+def test_task12_backend_priority_order_512_vs_576():
+    """SM90 sparse is preferred FIRST for 512 (glm5next NoPE) and LAST for
+    576 (DSV4), so DSV4's existing sparse preference order is preserved."""
+    from vllm.platforms.cuda import _get_backend_priorities
+
+    p512 = [
+        b.name
+        for b in _get_backend_priorities(
+            use_mla=True,
+            device_capability=DeviceCapability(8, 0),
+            num_heads=32,
+            kv_cache_dtype="auto",
+            use_non_causal=False,
+            head_size=512,
+        )
+    ]
+    p576 = [
+        b.name
+        for b in _get_backend_priorities(
+            use_mla=True,
+            device_capability=DeviceCapability(8, 0),
+            num_heads=32,
+            kv_cache_dtype="auto",
+            use_non_causal=False,
+            head_size=576,
+        )
+    ]
+    # 512: SM90 sparse before FlashAttn/FlashMLA/Triton sparse (preferred).
+    assert p512.index("FLASHINFER_MLA_SPARSE_SM90") < p512.index(
+        "TRITON_MLA_SPARSE"
+    )
+    # 576: SM90 sparse AFTER the reference DSV4 tail (fallback, not a
+    # preference change). Both keep the dense head identical.
+    assert p576[-1] == "FLASHINFER_MLA_SPARSE_SM90"
+    dense_head = [
+        "FLASH_ATTN_MLA",
+        "FLASHMLA",
+        "FLASHINFER_MLA",
+        "TRITON_MLA",
+    ]
+    assert p512[:4] == dense_head
+    assert p576[:4] == dense_head
+
+
+def test_task12_forced_triton_sparse_accepted_on_sm80():
+    """Forcing TRITON_MLA_SPARSE on sm80 (512) is accepted (no reasons)."""
+    _, _, cfg = _sparse_selection(DeviceCapability(8, 0), 512)
+    reasons = AttentionBackendEnum.TRITON_MLA_SPARSE.get_class().validate_configuration(
+        device_capability=DeviceCapability(8, 0), **cfg._asdict()
+    )
+    assert reasons == [], reasons
+
+
+def test_task12_forced_sm90_sparse_cleanly_rejected_on_sm80():
+    """Forcing FLASHINFER_MLA_SPARSE_SM90 on sm80 is a CLEAN rejection
+    (structured reasons), never an exception — the issue-54059 failure class."""
+    _, _, cfg = _sparse_selection(DeviceCapability(8, 0), 512)
+    reasons = (
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90.get_class().validate_configuration(
+            device_capability=DeviceCapability(8, 0), **cfg._asdict()
+        )
+    )
+    assert any("compute capability" in r for r in reasons), reasons
+
+
+def test_task12_forced_flashmla_sparse_rejected_for_head512():
+    """Forcing FLASHMLA_SPARSE with head_size 512 is rejected on head_size
+    (the native kernel only serves 576), regardless of capability."""
+    _, _, cfg = _sparse_selection(DeviceCapability(9, 0), 512)
+    reasons = (
+        AttentionBackendEnum.FLASHMLA_SPARSE.get_class().validate_configuration(
+            device_capability=DeviceCapability(9, 0), **cfg._asdict()
+        )
+    )
+    assert any("head_size" in r for r in reasons), reasons
+
+
+def test_task12_issue54059_regression_never_raises():
+    """Regression for vllm-project/vllm#54059 (sm8x head_size=512 sparse-MLA
+    backend-selection failure).
+
+    For every sm8x capability and both head sizes, selection must NEVER raise:
+    it either resolves a usable backend or returns structured invalid reasons.
+    The resolved backend, when present, must be the portable TRITON_MLA_SPARSE
+    (the sm80 path for glm5next/GLM-5.3), and the SM90/FlashMLA sparse entries
+    must be rejected as invalid reasons, not crash.
+    """
+    for cap in (
+        DeviceCapability(8, 0),
+        DeviceCapability(8, 6),
+        DeviceCapability(8, 9),
+    ):
+        for hs in (512, 576):
+            valid, invalid, _ = _sparse_selection(cap, hs)
+            # Never raises is the contract; reaching here proves it.
+            if valid:
+                assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], (
+                    f"cap={cap} hs={hs} resolved {valid}"
+                )
+            else:
+                # No usable backend: must be a structured invalid-reason
+                # dictionary, and TRITON_MLA_SPARSE must be present with a
+                # concrete reason (so a future capability/head-size regression
+                # that silently drops the sm80 path is caught).
+                assert AttentionBackendEnum.TRITON_MLA_SPARSE in invalid
