@@ -10,10 +10,11 @@ backend classes, and select/execute the Ampere DSV4 backend.
 Host constraint: the sparse-MLA *backend and kernel modules* import Triton at
 module scope (``fp8_sm80.py`` calls ``tl.constexpr`` on import), which needs a
 live GPU driver. On a CPU-only host (no CUDA) those modules cannot even be
-imported, so the parts that exercise them are marked ``skipif(not
-is_cuda_alike())`` -- pytest evaluates the skip before the body import runs,
-so the skipped tests pass (skip) on CPU and execute for real on GPU. This
-matches the repo's own Triton kernel test convention
+imported, so the parts that exercise them are gated on a REAL SM8x device
+capability probe (``torch.cuda.get_device_capability``, no spoofing) -- pytest
+evaluates the skip before the body import runs, so the skipped tests pass
+(skip) on CPU and execute for real on an A100/A800. This matches the repo's
+own Triton kernel test convention
 (tests/kernels/attention/test_triton_mla_sparse_kernel.py).
 
 The pure-logic contracts -- registry enum values, geometry constants, warmup
@@ -47,9 +48,27 @@ A100_SM_COUNT = 108
 
 CUDA_ALIKE = current_platform.is_cuda_alike()
 
+
+def _sm80_device_available() -> bool:
+    """Real SM8x (Ampere A100/A800) device probe — no capability spoofing.
+
+    The DSV4 Ampere backend supports only ``capability.major == 8``. A CUDA
+    host with an SM90/100 device must NOT run these tests (they would exercise
+    the wrong kernel path), and a spoofed capability would hide that.
+    """
+    if not CUDA_ALIKE:
+        return False
+    try:
+        import torch
+
+        return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] == 8
+    except Exception:
+        return False
+
+
 needs_gpu = pytest.mark.skipif(
-    not CUDA_ALIKE,
-    reason="imports Triton sparse-MLA backend/kernel modules; requires CUDA/ROCm",
+    not _sm80_device_available(),
+    reason="requires a real SM8x (Ampere) CUDA device; CPU/SM90+ skipped",
 )
 
 
@@ -86,7 +105,8 @@ def _select_ampere_attn_cls(device_capability):
 
     Returns ``(selected_class, is_ampere)``. Runs the genuine
     ``_select_dsv4_attn_cls`` (not a source-text search) after installing the
-    import hook and tl stub.
+    tl stub. The ``init_logger`` import regression was fixed in commit
+    8517e54a65, so the genuine import path works without a workaround hook.
     """
     _stub_triton_tl()
     from vllm.models.deepseek_v4.ampere.ampere_sparse import (
@@ -221,7 +241,6 @@ def test_warmup_autotune_covers_dsv4_backend() -> None:
     """
     from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
         _DEEPSEEK_V4_SPARSE_MLA_BACKENDS,
-        _GENERIC_SPARSE_MLA_BACKENDS,
         _INDEXER_PREFILL_CHUNK_METADATA_BACKENDS,
     )
 
@@ -232,108 +251,191 @@ def test_warmup_autotune_covers_dsv4_backend() -> None:
 
 
 @needs_gpu
-def test_ampere_dsv4_backend_selected_and_executes_on_sm80(monkeypatch) -> None:
-    """(e, GPU) On SM80, DSV4 selects the Ampere backend and its attention
-    kernel genuinely EXECUTES a decode, asserting against a torch reference.
+def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
+    """(e, GPU) The real SM80->Ampere DSV4 attention class is instantiated
+    with real plumbing and its DECODE path genuinely executes on SM8x,
+    asserting against a torch softmax reference.
 
-    This replaces the old test that only selected a class (finding 1a). Two
-    halves:
+    This replaces the previous test that (a) gated on ``is_cuda_alike``
+    instead of a real SM8x probe and (b) called the raw kernel
+    ``triton_mla_sparse_attention`` directly instead of exercising the
+    selected backend. Here the genuine ``DeepseekV4AmpereMLAAttention`` is
+    constructed with a real ``VllmConfig`` (DSV4 geometry, fp8_ds_mla cache,
+    SWA-only compress_ratio=1 layer), a real uint8 fp8_ds_mla SWA cache is
+    bound, and ``forward_mqa`` drives ``_forward_decode`` ->
+    ``rocm_sparse_attn_decode`` for real. The output must match a plain torch
+    softmax attention over the decoded fp8 cache.
 
-    1. Real selection: ``_select_dsv4_attn_cls`` maps SM80 ->
-       ``DeepseekV4AmpereMLAAttention`` (asserted via the import-hook workaround
-       since the step-4 merge dropped the ``init_logger`` import).
-    2. Real execution: the Ampere path's actual sparse-MLA decode kernel
-       (``triton_mla_sparse_attention``, the kernel ``rocm_sparse_attn_decode``
-       drives on SM8x) is launched for BOTH geometries (dim_qk 512 NoPE and
-       576 rope) with small deterministic shapes. split-KV must agree with
-       single-pass, and BOTH must match a plain torch softmax-attention
-       reference over the gathered KV rows.
-
-    The kernel-execution body is what the GPU skip guard protects; selection
-    itself is proven on CPU in ``test_ampere_selection_real_sm80_sm90_cpu``.
+    Finding-1a/b closure: selection is proven on CPU in
+    ``test_ampere_selection_real_sm80_sm90_cpu``; this test is the real
+    execution proof.
     """
     _stub_triton_tl()
+
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    # Register the REAL DSV4 model class in-process (avoids the subprocess
+    # arch-inspection that fails without a GPU driver); this is the genuine
+    # registered class, not a stub.
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
+
+    ModelRegistry.register_model("DeepseekV4ForCausalLM", DeepseekV4ForCausalLM)
+
+    vc, cfg_tmpdir = _make_dsv4_vllm_config()
+    try:
+        _run_ampere_decode(vc)
+    finally:
+        import shutil
+
+        shutil.rmtree(cfg_tmpdir, ignore_errors=True)
+
+
+def _run_ampere_decode(vc) -> None:
+    """Instantiate the real Ampere attention and execute its decode path."""
+    import contextlib
+    import os
+    import tempfile
+
     import torch
 
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
     from vllm.models.deepseek_v4.ampere.ampere_sparse import (
         DeepseekV4AmpereMLAAttention,
-        DeepseekV4AmpereMLASparseBackend,
-    )
-    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
-
-    cfg = _make_vllm_config_for_backend(None)
-    monkeypatch.setattr(
-        "vllm.platforms.current_platform.get_device_capability",
-        lambda: DeviceCapability(8, 0),
-    )
-    cls = _select_dsv4_attn_cls(cfg)
-    assert cls is DeepseekV4AmpereMLAAttention
-    assert DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
-        DeviceCapability(8, 0)
     )
 
-    from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
-        triton_mla_sparse_attention,
+    fd, tf = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        with set_current_vllm_config(vc):
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                distributed_init_method=f"file://{tf}",
+                local_rank=0,
+                backend="gloo",
+            )
+            initialize_model_parallel(1, 1)
+            attn = DeepseekV4AmpereMLAAttention(vc, "model.layers.0.attn")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tf)
+
+    assert type(attn) is DeepseekV4AmpereMLAAttention
+    assert attn.compress_ratio == 1  # SWA-only layer: decode is the swa_only path
+    assert attn.head_dim == 512 and attn.nope_head_dim == 448
+    assert attn.rope_head_dim == 64
+
+    # --- Real fp8_ds_mla SWA cache ---
+    # Segmented per-block layout (matches the C++ insert op and the decode
+    # kernel): block bytes = [N*576 data][N*8 scale]; token pos data at
+    # pos*576, scale at N*576 + pos*8. The kernel uses stride(0) as the block
+    # stride and shape[1] as the block size, so a [B, N, C] view with
+    # stride(0)=N*584 is correct regardless of C; we write via the flat view.
+    block_size = 64
+    num_blocks = 8
+    swa_cache = torch.zeros(
+        num_blocks, 1, block_size, 584, dtype=torch.uint8, device="cuda"
     )
+    attn.swa_cache_layer.bind_kv_cache(swa_cache)
 
-    def _torch_reference(q, kv, indices, sm_scale, block_dv=512):
-        """Plain softmax attention over the gathered KV rows.
-
-        Matches the kernel exactly: qk uses ALL dim_qk lanes (NoPE + rope),
-        but the accumulator V is the first ``block_dv`` lanes of each k row
-        (the kernel's ``BLOCK_DV``), so the output head dim is ``block_dv``.
-        """
-        kv2 = kv.squeeze(1)  # [seq_kv, D]
-        rows = indices.squeeze(1)  # [T, topk]
-        k = kv2[rows]  # [T, topk, D]
-        qk = torch.bmm(q, k.transpose(1, 2)) * sm_scale  # [T, H, topk]
-        w = torch.softmax(qk, dim=-1)
-        v = k[:, :, :block_dv]  # [T, topk, block_dv]
-        return torch.bmm(w, v)  # [T, H, block_dv]
-
+    # Encode a real bf16 KV into fp8_ds_mla layout (segmented flat offsets).
     torch.manual_seed(0)
-    for dim_qk in (512, 576):
-        num_tokens, num_heads, topk = 4, 8, 256
+    num_tokens = 8
+    kv_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda") * 0.1
+    nope = kv_bf16[:, :448]
+    amax = nope.abs().amax(dim=1, keepdim=True)
+    scale = torch.clamp(amax / 448.0, min=1e-4)  # non-FNUZ: /448
+    scale = torch.exp2(torch.ceil(torch.log2(scale)))  # ue8m0 pow2
+    encoded = (scale.log2() + 127.0).to(torch.uint8)
+    fp8 = (nope / scale).to(torch.float8_e4m3fn)
+    rope = kv_bf16[:, 448:].to(torch.bfloat16)  # 64 bf16 rope lanes
+
+    flat = swa_cache.view(torch.uint8)
+    block = 0
+    data_base = block * (block_size * 584)
+    scale_base = block * (block_size * 584) + block_size * 576
+    flat[
+        data_base + torch.arange(num_tokens)[:, None] * 576
+        + torch.arange(448)[None, :]
+    ] = fp8.view(torch.uint8)
+    flat[
+        data_base + torch.arange(num_tokens)[:, None] * 576 + 448
+        + torch.arange(64)[None, :]
+    ] = rope.view(torch.uint8)
+    flat[
+        scale_base + torch.arange(num_tokens)[:, None] * 8
+        + torch.arange(7)[None, :]
+    ] = encoded[:, :7]
+
+    # Real SWA decode metadata: 4 decode tokens, each attending to 8 window
+    # rows (global slots 0..7 in block 0). The decode kernel reads one row per
+    # query token (main_indices=[T, width], main_lengths=[T]).
+    num_decodes = 4
+    num_decode_tokens = 4
+    swa_indices = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    swa_lens = torch.full((num_decode_tokens,), 8, dtype=torch.int32, device="cuda")
+
+    from vllm.models.deepseek_v4.amd.rocm import (
+        DeepseekV4ROCMAiterSparseSWAMetadata,
+    )
+
+    swa_meta = DeepseekV4ROCMAiterSparseSWAMetadata(
+        block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(
+            num_decode_tokens, dtype=torch.int32, device="cuda"
+        ),
+        block_size=block_size,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode_swa_indices=swa_indices,
+        decode_swa_lens=swa_lens,
+        decode_swa_width=8,
+    )
+
+    from vllm.forward_context import set_forward_context
+
+    attn_metadata = {attn.swa_cache_layer.prefix: swa_meta}
+    with set_forward_context(attn_metadata, vc):
         q = torch.randn(
-            num_tokens, num_heads, dim_qk, dtype=torch.bfloat16, device="cuda"
+            num_decode_tokens,
+            8,
+            512,
+            dtype=torch.bfloat16,
+            device="cuda",
         )
-        kv = torch.randn(
-            2048, 1, dim_qk, dtype=torch.bfloat16, device="cuda"
+        out = torch.empty_like(q)
+        attn.forward_mqa(
+            q,
+            torch.empty(0, device="cuda"),
+            torch.zeros(num_decode_tokens, dtype=torch.int64, device="cuda"),
+            out,
         )
-        indices = torch.randint(
-            0, 2048, (num_tokens, 1, topk), dtype=torch.int32, device="cuda"
-        )
-        sm_scale = 0.1
 
-        # Single-pass and split-KV must both match the torch reference.
-        out_ref = _torch_reference(
-            q.float(), kv.float(), indices.long(), sm_scale
-        )
-        for num_kv_splits in (1, 2, 4):
-            out = triton_mla_sparse_attention(
-                q, kv, indices, sm_scale=sm_scale, num_kv_splits=num_kv_splits
-            )
-            # The kernel's accumulator/out head dim is BLOCK_DV (512), not the
-            # full dim_qk (576 for rope geometry).
-            assert out.shape == (num_tokens, num_heads, 512)
-            torch.testing.assert_close(
-                out.float(),
-                out_ref.float(),
-                atol=0.05,
-                rtol=0.05,
-            )
-
-    # Non-sm80 must NOT pick Ampere.
-    monkeypatch.setattr(
-        "vllm.platforms.current_platform.get_device_capability",
-        lambda: DeviceCapability(9, 0),
-    )
-    from vllm.models.deepseek_v4.nvidia.flashmla import (
-        DeepseekV4FlashMLAAttention,
-    )
-
-    assert _select_dsv4_attn_cls(cfg) is not DeepseekV4AmpereMLAAttention
-    assert isinstance(DeepseekV4FlashMLAAttention, type)
+    # Reference: softmax attention over the decoded fp8 cache (same layout the
+    # kernel reads: fp8 nope * exp2(encoded-127), bf16 rope).
+    nope_decoded = fp8.to(torch.float32) * torch.exp2(encoded.float() - 127.0)[:, None]
+    kv_ref = torch.cat([nope_decoded, rope.to(torch.float32)], dim=-1)
+    rows = swa_indices.long()
+    gathered = kv_ref[rows]  # [T, 8, 512]
+    qk = torch.einsum("thd,tkd->thk", q.float(), gathered) * attn.scale
+    w = torch.softmax(qk, dim=-1)
+    ref = torch.einsum("thk,tkd->thd", w, gathered)
+    torch.testing.assert_close(out.float(), ref.float(), atol=0.05, rtol=0.05)
 
 
 def test_ampere_selection_real_sm80_sm90_cpu() -> None:
@@ -416,3 +518,107 @@ def _make_vllm_config_for_backend(backend):
     cfg = VllmConfig.__new__(VllmConfig)
     cfg.attention_config = _AttnCfg()
     return cfg
+
+
+def _make_dsv4_vllm_config():
+    """Build a real VllmConfig with a DSV4-shaped hf config (SWA-only layer).
+
+    The hf_config is a real ``DeepseekV3Config`` (the class ``deepseek_v4``
+    attention imports) carrying the DSV4 fields the attention layer reads:
+    head_dim 512 (448 NoPE + 64 RoPE), compress_ratio=1 (SWA-only), fp8_ds_mla
+    KV cache. The model class is registered in the registry by the caller; this
+    builds the config object with real project plumbing (no fakes).
+
+    Returns ``(vllm_config, tmpdir)``; the caller must remove ``tmpdir`` when
+    done (``ModelConfig`` loads the hf config from a local file we write).
+    """
+    import json
+    import tempfile
+
+    from vllm.config import (
+        CacheConfig,
+        CompilationConfig,
+        DeviceConfig,
+        LoadConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="dsv4-cfg-")
+    with open(f"{tmpdir}/config.json", "w") as f:
+        json.dump(
+            {
+                "model_type": "deepseek_v3",
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 8,
+                "intermediate_size": 128,
+            },
+            f,
+        )
+
+    model_config = ModelConfig(
+        model=tmpdir,
+        tokenizer=tmpdir,
+        trust_remote_code=True,
+        dtype="auto",
+        seed=0,
+        max_model_len=4096,
+    )
+    hc = model_config.hf_config
+    for k, v in dict(
+        head_dim=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=448,
+        kv_lora_rank=512,
+        q_lora_rank=32,
+        o_lora_rank=16,
+        o_groups=8,
+        sliding_window=64,
+        compress_ratios=[1],
+        index_topk=512,
+        index_n_heads=64,
+        index_head_dim=128,
+        rope_theta=10000,
+        compress_rope_theta=10000,
+        max_position_embeddings=4096,
+        rms_norm_eps=1e-6,
+    ).items():
+        setattr(hc, k, v)
+    hc.rope_parameters.update(
+        {
+            "factor": 1.0,
+            "original_max_position_embeddings": 4096,
+            "apply_yarn_scaling": False,
+            "extrapolation_factor": 1.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 0.0,
+            "mscale_all_dim": 0.0,
+        }
+    )
+
+    cache_config = CacheConfig(block_size=64, cache_dtype="fp8_ds_mla")
+    cache_config.num_gpu_blocks = 1000
+    cache_config.num_cpu_blocks = 0
+
+    vc = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        parallel_config=ParallelConfig(tensor_parallel_size=1),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=256,
+            max_num_batched_tokens=8192,
+            enable_chunked_prefill=True,
+            max_model_len=4096,
+            is_encoder_decoder=False,
+        ),
+        device_config=DeviceConfig(device="cpu"),
+        load_config=LoadConfig(),
+        compilation_config=CompilationConfig(),
+    )
+    return vc, tmpdir
