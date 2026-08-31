@@ -117,10 +117,17 @@ def _select_ampere_attn_cls(device_capability):
     cfg = _make_vllm_config_for_backend(None)
     import vllm.platforms as platforms_mod
 
+    # Temporary capability override for the CPU-only host; restore it in all
+    # paths so the GPU test's REAL selection (which reads the same global)
+    # always sees the genuine device capability, never a leaked fake.
+    orig = platforms_mod.current_platform.get_device_capability
     platforms_mod.current_platform.get_device_capability = (
         lambda: device_capability
     )
-    cls = _select_dsv4_attn_cls(cfg)
+    try:
+        cls = _select_dsv4_attn_cls(cfg)
+    finally:
+        platforms_mod.current_platform.get_device_capability = orig
     return cls, (cls is DeepseekV4AmpereMLAAttention)
 
 
@@ -266,17 +273,19 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     ``rocm_sparse_attn_decode`` for real. The output must match a plain torch
     softmax attention over the decoded fp8 cache.
 
-    Finding-1a/b closure: selection is proven on CPU in
+    Selection is REAL and on-device: ``_select_dsv4_attn_cls`` runs under the
+    real SM8x device capability (no stub, no monkeypatch) and the class it
+    returns is the one instantiated below. CPU selection proof remains in
     ``test_ampere_selection_real_sm80_sm90_cpu``; this test is the real
-    execution proof.
+    execution proof on an actual SM8x device.
     """
-    _stub_triton_tl()
-
     from vllm.model_executor.models.registry import ModelRegistry
 
-    # Register the REAL DSV4 model class in-process (avoids the subprocess
-    # arch-inspection that fails without a GPU driver); this is the genuine
-    # registered class, not a stub.
+    # Register the REAL DSV4 model class in-process. This avoids the
+    # model-class resolution subprocess, which would fork after CUDA
+    # initialization (unsafe on a live GPU device); the registered class is
+    # the genuine one, not a stub. Triton modules import for real here -- on
+    # this SM8x device the driver is live, so no tl stub is installed.
     from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
 
     ModelRegistry.register_model("DeepseekV4ForCausalLM", DeepseekV4ForCausalLM)
@@ -291,7 +300,8 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
 
 
 def _run_ampere_decode(vc) -> None:
-    """Instantiate the real Ampere attention and execute its decode path."""
+    """Select the real Ampere attention (via ``_select_dsv4_attn_cls`` on the
+    real device) and execute its decode path."""
     import contextlib
     import os
     import tempfile
@@ -306,6 +316,7 @@ def _run_ampere_decode(vc) -> None:
     from vllm.models.deepseek_v4.ampere.ampere_sparse import (
         DeepseekV4AmpereMLAAttention,
     )
+    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
 
     fd, tf = tempfile.mkstemp()
     os.close(fd)
@@ -319,7 +330,17 @@ def _run_ampere_decode(vc) -> None:
                 backend="gloo",
             )
             initialize_model_parallel(1, 1)
-            attn = DeepseekV4AmpereMLAAttention(vc, "model.layers.0.attn")
+            # REAL selection under the REAL device capability: the genuine
+            # _select_dsv4_attn_cls maps SM8x to DeepseekV4AmpereMLAAttention
+            # (backend None / TRITON_MLA_SPARSE_DSV4), and we instantiate
+            # exactly the class it returned -- not a separately imported
+            # reference.
+            selected = _select_dsv4_attn_cls(vc)
+            assert selected is DeepseekV4AmpereMLAAttention, (
+                f"SM8x real selection resolved to {selected.__name__}, "
+                "expected DeepseekV4AmpereMLAAttention"
+            )
+            attn = selected(vc, "model.layers.0.attn")
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tf)
@@ -428,7 +449,28 @@ def _run_ampere_decode(vc) -> None:
 
     # Reference: softmax attention over the decoded fp8 cache (same layout the
     # kernel reads: fp8 nope * exp2(encoded-127), bf16 rope).
-    nope_decoded = fp8.to(torch.float32) * torch.exp2(encoded.float() - 127.0)[:, None]
+    #
+    # Shape chain (re-derived after Finding 1; the decode-output reference
+    # must compose end to end):
+    #   fp8            [T=8, 448]  float8 nope lanes
+    #   encoded        [8, 1]      ue8m0 per-token exponent (already 2-D)
+    #   exp2(enc-127)  [8, 1]      per-token dequant scale
+    #   nope_decoded   [8, 448]    fp8 * scale broadcasts over the 448 cols
+    #   rope           [8, 64]     bf16 rope lanes
+    #   kv_ref         [8, 512]    cat(nope 448, rope 64) -- per-token KV.
+    #                              (on-disk cache slot stride is 576 = 512
+    #                              data + 64 pad; 576 is NOT the KV dim)
+    #   rows           [4, 8]      swa_indices (T=4 decodes, width=8)
+    #   gathered       [4, 8, 512] kv_ref[rows] -> [T, width, kv_dim]
+    #   q              [4, 8, 512] [T, heads, head_dim=512]
+    #   qk             [4, 8, 8]   einsum(thd,tkd->thk) * attn.scale
+    #   ref            [4, 8, 512] == out [T, heads, head_dim]
+    #
+    # Finding-1 bug: encoded is already [8, 1], so the extra ``[:, None]`` on
+    # exp2(...) made the scale [8, 1, 1] and the product [8, 8, 448] -- which
+    # cannot torch.cat with the [8, 64] rope part (this is a pure test-code
+    # defect; it would crash on any host).
+    nope_decoded = fp8.to(torch.float32) * torch.exp2(encoded.float() - 127.0)
     kv_ref = torch.cat([nope_decoded, rope.to(torch.float32)], dim=-1)
     rows = swa_indices.long()
     gathered = kv_ref[rows]  # [T, 8, 512]
