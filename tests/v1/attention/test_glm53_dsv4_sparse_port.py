@@ -480,9 +480,17 @@ def _run_ampere_decode(vc) -> None:
     torch.testing.assert_close(out.float(), ref.float(), atol=0.05, rtol=0.05)
 
 
+cpu_only = pytest.mark.skipif(
+    CUDA_ALIKE,
+    reason="selection is proven natively by the on-device GPU test on CUDA hosts; "
+    "the tl stub installed here is CPU-host-only and would poison Triton",
+)
+
+
+@cpu_only
 def test_ampere_selection_real_sm80_sm90_cpu() -> None:
-    """(f, CPU) The REAL SM80->Ampere selection function runs on a GPU-less
-    host and resolves to the Ampere backend for both head geometries.
+    """(f, CPU-only) The REAL SM80->Ampere selection function runs on a
+    GPU-less host and resolves to the Ampere backend for both head geometries.
 
     Finding 1b: the selection proof must invoke the genuine selection logic
     (``_select_dsv4_attn_cls``), not search source text. This test drives that
@@ -490,6 +498,15 @@ def test_ampere_selection_real_sm80_sm90_cpu() -> None:
     the Ampere DSV4 attention) and ``DeviceCapability(9, 0)`` (asserting it is
     NOT), parameterized over the two sparse-MLA head geometries via the
     geometry constants the kernel derives dim_qk from.
+
+    CPU-host-only by design: this test installs ``_stub_triton_tl()``, which
+    permanently replaces the module-global ``vllm.triton_utils.tl`` so the real
+    selection function can be imported and exercised without a GPU driver. On a
+    CUDA host that global replacement would leak into (and break) other tests,
+    so on CUDA hosts this test is skipped and the division of labor is:
+      - CPU hosts:      this test proves REAL selection via the tl stub.
+      - CUDA hosts:     ``test_ampere_dsv4_backend_instantiates_and_executes_decode``
+        (needs_gpu) proves REAL on-device selection with no stub.
     """
     from vllm.platforms.interface import DeviceCapability
 
