@@ -766,7 +766,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   // with it the pivot, the selected set, and the output bounds). Zero it
   // explicitly behind the initial barrier — no extra synchronization needed.
   if (cta_in_group == 0) {
-    uint32_t* round0_hist = state->histogram[(iter * 4) % 3];
+    uint32_t* round0_hist = state->histogram[(radix_iter * 4) % 3];
     for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
       round0_hist[i] = 0;
     }
@@ -912,7 +912,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   // (< 64K elements), so 16 bits per component suffice. The counts buffer
   // reuses the histogram slot that is not referenced again until it is
   // zeroed (behind a barrier) in the next iteration's round 0/1.
-  uint32_t* counts_buf = state->histogram[(iter * 4 + 5) % 3];
+  uint32_t* counts_buf = state->histogram[(radix_iter * 4 + 5) % 3];
   if (tx == 0) {
     counts_buf[cta_in_group] = (suffix_sum[0] << 16) | suffix_sum[1];
     red_release(&state->arrival_counter, 1);
