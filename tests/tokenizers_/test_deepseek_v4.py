@@ -76,16 +76,13 @@ def test_deepseek_v4_tokenizer_registered():
     )
 
 
-def test_deepseek_v4_defaults_to_thinking_with_high_effort():
+def test_deepseek_v4_defaults_to_chat_mode():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
-    assert prompt.endswith("<｜Assistant｜><think>")
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
 
 
 @pytest.mark.parametrize("kwargs", [{"thinking": True}, {"enable_thinking": True}])
@@ -96,109 +93,7 @@ def test_deepseek_v4_enables_thinking_with_compatible_kwargs(kwargs):
         **kwargs,
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
-    assert prompt.endswith("<｜Assistant｜><think>")
-
-
-@pytest.mark.parametrize("kwargs", [{"thinking": False}, {"enable_thinking": False}])
-def test_deepseek_v4_explicitly_disables_thinking(kwargs):
-    prompt = _tokenizer().apply_chat_template(
-        [{"role": "user", "content": "Hello"}],
-        tokenize=False,
-        **kwargs,
-    )
-
-    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
-
-
-@pytest.mark.parametrize(
-    ("enable_thinking", "thinking_token"),
-    [(False, "</think>"), (True, "<think>")],
-)
-def test_deepseek_v4_appends_assistant_transition_after_trailing_system(
-    enable_thinking, thinking_token
-):
-    prompt = _tokenizer().apply_chat_template(
-        [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "system", "content": "Be concise."},
-        ],
-        tokenize=False,
-        enable_thinking=enable_thinking,
-        reasoning_effort="low",
-    )
-
-    assert prompt == (
-        "<｜begin▁of▁sentence｜>You are helpful."
-        f"<｜User｜>What is 2+2?Be concise.<｜Assistant｜>{thinking_token}"
-    )
-
-
-def test_deepseek_v4_does_not_transition_after_mid_conversation_system():
-    prompt = _tokenizer().apply_chat_template(
-        [
-            {"role": "user", "content": "What is 3+3?"},
-            {"role": "assistant", "content": "6"},
-            {"role": "system", "content": "Answer in French."},
-            {"role": "user", "content": "What is 5+5?"},
-        ],
-        tokenize=False,
-        enable_thinking=False,
-    )
-
-    assert prompt == (
-        "<｜begin▁of▁sentence｜><｜User｜>What is 3+3?"
-        "<｜Assistant｜></think>6<｜end▁of▁sentence｜>"
-        "Answer in French.<｜User｜>What is 5+5?"
-        "<｜Assistant｜></think>"
-    )
-
-
-@pytest.mark.parametrize(
-    ("enable_thinking", "expected"),
-    [
-        (
-            False,
-            "<｜begin▁of▁sentence｜>rules<｜Assistant｜></think>answer"
-            "<｜end▁of▁sentence｜>",
-        ),
-        (
-            True,
-            "<｜begin▁of▁sentence｜>rules<｜Assistant｜><think>reason</think>answer"
-            "<｜end▁of▁sentence｜>",
-        ),
-    ],
-)
-def test_deepseek_v4_transitions_from_system_to_assistant(enable_thinking, expected):
-    prompt = _tokenizer().apply_chat_template(
-        [
-            {"role": "system", "content": "rules"},
-            {
-                "role": "assistant",
-                "reasoning": "reason",
-                "content": "answer",
-            },
-        ],
-        tokenize=False,
-        enable_thinking=enable_thinking,
-        reasoning_effort="low",
-    )
-
-    assert prompt == expected
-
-
-def test_deepseek_v4_unknown_role_raises_value_error():
-    # Invalid roles are client errors: they must surface as ValueError
-    # (mapped to HTTP 400 by the OpenAI serving layer), not
-    # NotImplementedError (mapped to HTTP 501).
-    with pytest.raises(ValueError, match="Invalid role: SYSTEM"):
-        _tokenizer().apply_chat_template(
-            [{"role": "SYSTEM", "content": "Hello"}],
-            tokenize=False,
-        )
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
 
 
 def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
@@ -228,10 +123,7 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert "</｜DSML｜tool_calls>" in prompt
     assert "function_calls" not in prompt
     assert '"name": "get_weather"' in prompt
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
-    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜><think>")
+    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
 
 
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
@@ -291,17 +183,8 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert 'parameter name="arguments"' not in prompt
 
 
-@pytest.mark.parametrize(
-    ("reasoning_effort", "expected_prefix"),
-    [
-        ("low", "<｜begin▁of▁sentence｜><｜User｜>Hello"),
-        ("high", "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"),
-        ("max", "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"),
-    ],
-)
-def test_deepseek_v4_renders_0731_reasoning_effort_prompts(
-    reasoning_effort, expected_prefix
-):
+@pytest.mark.parametrize("reasoning_effort", ["minimal", "low", "medium", "high"])
+def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -310,7 +193,7 @@ def test_deepseek_v4_renders_0731_reasoning_effort_prompts(
     )
 
     assert prompt.endswith("<｜Assistant｜><think>")
-    assert prompt.startswith(expected_prefix)
+    assert "Reasoning Effort: Absolute maximum" not in prompt
 
 
 def test_deepseek_v4_none_reasoning_effort_disables_thinking():
@@ -328,11 +211,11 @@ def test_deepseek_v4_none_reasoning_effort_disables_thinking():
     ("reasoning_effort", "expected_mode", "expected_effort"),
     [
         ("none", "chat", None),
-        ("minimal", "thinking", "low"),
-        ("low", "thinking", "low"),
-        ("medium", "thinking", "low"),
+        ("minimal", "thinking", "high"),
+        ("low", "thinking", "high"),
+        ("medium", "thinking", "high"),
         ("high", "thinking", "high"),
-        ("xhigh", "thinking", "high"),
+        ("xhigh", "thinking", "max"),
         ("max", "thinking", "max"),
         ("unexpected", "thinking", "high"),
     ],
@@ -365,7 +248,7 @@ def test_deepseek_v4_maps_compatible_thinking_reasoning_effort_values(
     assert captured_kwargs[-1]["reasoning_effort"] == expected_effort
 
 
-def test_deepseek_v4_renders_0731_max_reasoning_effort():
+def test_deepseek_v4_preserves_reference_max_reasoning_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -373,10 +256,12 @@ def test_deepseek_v4_renders_0731_max_reasoning_effort():
         reasoning_effort="max",
     )
 
-    assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
 
 
-def test_deepseek_v4_maps_xhigh_to_high_reasoning_effort():
+def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -392,10 +277,10 @@ def test_deepseek_v4_maps_xhigh_to_high_reasoning_effort():
 @pytest.mark.parametrize(
     ("case_id", "kwargs"),
     [
-        (1, {"thinking": True, "reasoning_effort": "low"}),
-        (2, {"thinking": True, "reasoning_effort": "low"}),
-        (3, {"thinking": True, "reasoning_effort": "low"}),
-        (4, {"thinking": False}),
+        (1, {"thinking": True}),
+        (2, {"thinking": True}),
+        (3, {"thinking": True}),
+        (4, {}),
     ],
 )
 def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
@@ -405,25 +290,69 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
     assert prompt == expected
 
 
-def test_deepseek_v4_rejects_empty_developer_content():
-    with pytest.raises(ValueError):
-        _tokenizer().apply_chat_template(
-            [{"role": "developer", "content": ""}],
-            tokenize=False,
-            enable_thinking=True,
-            reasoning_effort="low",
-        )
+def _render(messages, **kwargs):
+    return _tokenizer().apply_chat_template(
+        conversation=messages, messages=messages, tokenize=False, **kwargs
+    )
 
 
 @pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"thinking_mode": "bogus"},
-        {"thinking_mode": "thinking", "reasoning_effort": "turbo"},
-    ],
+    ("kwargs", "expected_tail"),
+    [({}, "</think>"), ({"thinking": True}, "<think>")],
 )
-def test_deepseek_v4_encode_messages_rejects_invalid_arguments(kwargs):
-    from vllm.tokenizers.deepseek_v4_encoding import encode_messages
+def test_deepseek_v4_trailing_system_gets_generation_prompt(kwargs, expected_tail):
+    """A system message after the last user turn must still open an assistant turn.
 
-    with pytest.raises(ValueError):
-        encode_messages([{"role": "user", "content": "Hello"}], **kwargs)
+    Agent frameworks append context/reminder system messages after the user
+    turn. Without the generation prompt the model sees no assistant boundary
+    and continues the prompt as a document instead of answering.
+    """
+    prompt = _render(
+        [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "write the report"},
+            {"role": "system", "content": "Available agent types: ..."},
+        ],
+        **kwargs,
+    )
+
+    assert prompt.endswith("<｜Assistant｜>" + expected_tail)
+
+
+def test_deepseek_v4_system_only_conversation_gets_generation_prompt():
+    prompt = _render([{"role": "system", "content": "just a system prompt"}])
+
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_mid_conversation_system_does_not_open_a_turn():
+    """A system message that is not last must not emit a spurious turn marker."""
+    prompt = _render(
+        [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "system", "content": "extra context"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+    assert prompt.count("<｜Assistant｜>") == 1
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_system_before_latest_reminder_emits_no_turn_marker():
+    """Regression: a non-final system message must not open an assistant turn.
+
+    `latest_reminder` is exempt from the "what may follow" early return, so a
+    system message preceding one reaches the generation-prompt branch. Treating
+    it as a turn boundary injects a stray marker mid-prompt.
+    """
+    prompt = _render(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "latest_reminder", "content": "2026-08-04"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+    assert prompt.index("<｜latest_reminder｜>") < prompt.index("<｜Assistant｜>")
+    assert prompt.count("<｜Assistant｜>") == 1

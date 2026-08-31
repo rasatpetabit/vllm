@@ -131,12 +131,23 @@ def _get_backend_priorities(
         elif device_capability.major == 12:
             return [
                 AttentionBackendEnum.TRITON_MLA,
+                # FP8 KV cache only; with BF16 KV it is rejected by
+                # supports_combination and selection falls through to the
+                # Triton sparse backend below.
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
         else:
+            # TRITON_MLA_SPARSE is the portable Triton sparse-MLA fallback
+            # (supports all compute capabilities, 512 NoPE + 576 rope
+            # geometries). It is the sm80 (A100) path for glm5next / GLM-5.3
+            # (head_size 512, NoPE): the FlashInfer sm90 kernel and FlashMLA
+            # sparse reject sm80, so without it the sparse tail would be empty
+            # on Ampere. Kept last so sm90/sm100 keep their preferred kernels.
             sparse_tail = [
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
             flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
             if head_size == 512:
