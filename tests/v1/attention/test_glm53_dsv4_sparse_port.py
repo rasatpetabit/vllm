@@ -23,6 +23,7 @@ run on every host. They are the guards that must never rot on scarce hardware.
 """
 
 import pytest
+import textwrap
 
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -72,63 +73,116 @@ needs_gpu = pytest.mark.skipif(
 )
 
 
-def _stub_triton_tl():
-    """Make ``vllm.triton_utils.tl`` import-safe on a CPU-only host.
+def _subprocess_select_ampere_attn():
+    """Run the REAL SM80->Ampere selection in a fresh subprocess (CPU-only).
 
-    The sparse-MLA backend/kernel modules call ``tl.constexpr`` at module
-    scope, which raises ``TypeError: 'NoneType' object is not callable`` when
-    Triton is disabled (no GPU driver). We swap in a minimal stub that returns
-    its argument, so the REAL selection function and backend classes can be
-    imported and exercised without a GPU.
+    The sparse-MLA import chain reaches ``vllm.v1.attention.ops.fp8_sm80``,
+    which calls ``tl.constexpr`` at module scope; with Triton disabled (no GPU
+    driver) that raises ``TypeError: 'NoneType' object is not callable``. We
+    install a minimal tl stub INSIDE the subprocess so the genuine selection
+    function ``_select_dsv4_attn_cls`` can be imported and exercised -- then
+    the subprocess exits and the parent process is byte-for-byte untouched.
+
+    Returns a dict of the child's observable results (class names per
+    capability + the backend capability-gate booleans).
     """
-    import types
+    import json
+    import os
+    import subprocess
+    import sys
 
+    script = textwrap.dedent(
+        """\
+        import json
+        import sys
+        import types
+
+        sys.path.insert(0, {worktree!r})
+
+        # The tl stub lives ONLY in this child process. The parent never
+        # mutates vllm.triton_utils.tl.
+        import vllm.triton_utils as tu
+
+        tu.tl = types.SimpleNamespace(
+            constexpr=lambda v: v,
+            int32=lambda v: v,
+            float32=lambda v: v,
+            int64=lambda v: v,
+        )
+
+        from vllm.config import VllmConfig
+
+        class _AttnCfg:
+            def __init__(self, backend):
+                self.backend = backend
+                self.use_fp4_indexer_cache = False
+
+        cfg = VllmConfig.__new__(VllmConfig)
+        cfg.attention_config = _AttnCfg(None)
+
+        import vllm.platforms as platforms_mod
+
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+            DeepseekV4AmpereMLASparseBackend,
+        )
+        from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
+        from vllm.platforms.interface import DeviceCapability
+
+        results = {{}}
+        for name, cap in (
+            ("sm80", DeviceCapability(8, 0)),
+            ("sm90", DeviceCapability(9, 0)),
+        ):
+            orig = platforms_mod.current_platform.get_device_capability
+            platforms_mod.current_platform.get_device_capability = lambda c=cap: c
+            try:
+                cls = _select_dsv4_attn_cls(cfg)
+                results[name] = cls.__name__
+                results[name + "_is_ampere"] = cls is DeepseekV4AmpereMLAAttention
+            finally:
+                platforms_mod.current_platform.get_device_capability = orig
+
+        results["backend_name"] = DeepseekV4AmpereMLASparseBackend.get_name()
+        results["backend_sm80"] = DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
+            DeviceCapability(8, 0)
+        )
+        results["backend_sm90"] = DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
+            DeviceCapability(9, 0)
+        )
+
+        print(json.dumps(results))
+        """
+    ).format(worktree=os.getcwd())
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            "subprocess selection proof failed\n"
+            f"rc={proc.returncode}\nstdout={proc.stdout[-800:]}\n"
+            f"stderr={proc.stderr[-800:]}"
+        )
+    # Last non-empty stdout line is the JSON result.
+    payload = [l for l in proc.stdout.splitlines() if l.strip()][-1]
+    return json.loads(payload)
+
+
+def _prove_parent_tl_untouched():
+    """Assert the parent's vllm.triton_utils.tl is IDENTICAL after the
+    subprocess selection proof ran (the Finding-1 contract: no persistent
+    mutation, no pollution of later tests in the same pytest process).
+
+    Imported lazily so the assertion reflects the post-test value without a
+    stale earlier import, and compared by identity (same module object).
+    """
     import vllm.triton_utils as tu
 
-    if _stub_triton_tl.installed:
-        return
-    tl_stub = types.SimpleNamespace(
-        constexpr=lambda v: v,
-        int32=lambda v: v,
-        float32=lambda v: v,
-        int64=lambda v: v,
-    )
-    tu.tl = tl_stub
-    _stub_triton_tl.installed = True
-
-
-_stub_triton_tl.installed = False
-
-
-def _select_ampere_attn_cls(device_capability):
-    """Invoke the REAL model-layer SM80->Ampere selection function on CPU.
-
-    Returns ``(selected_class, is_ampere)``. Runs the genuine
-    ``_select_dsv4_attn_cls`` (not a source-text search) after installing the
-    tl stub. The ``init_logger`` import regression was fixed in commit
-    8517e54a65, so the genuine import path works without a workaround hook.
-    """
-    _stub_triton_tl()
-    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
-        DeepseekV4AmpereMLAAttention,
-    )
-    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
-
-    cfg = _make_vllm_config_for_backend(None)
-    import vllm.platforms as platforms_mod
-
-    # Temporary capability override for the CPU-only host; restore it in all
-    # paths so the GPU test's REAL selection (which reads the same global)
-    # always sees the genuine device capability, never a leaked fake.
-    orig = platforms_mod.current_platform.get_device_capability
-    platforms_mod.current_platform.get_device_capability = (
-        lambda: device_capability
-    )
-    try:
-        cls = _select_dsv4_attn_cls(cfg)
-    finally:
-        platforms_mod.current_platform.get_device_capability = orig
-    return cls, (cls is DeepseekV4AmpereMLAAttention)
+    return tu.tl
 
 
 def test_geometry_constants_cover_both_lanes() -> None:
@@ -279,11 +333,12 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     ``test_ampere_selection_real_sm80_sm90_cpu``; this test is the real
     execution proof on an actual SM8x device.
 
-    Order-independence (round 5): this test mutates process-global state — the
+    Order-independence (round 5/6): this test mutates process-global state — the
     ModelRegistry entry for ``DeepseekV4ForCausalLM`` and the distributed /
-    model-parallel environment. Both are restored in ``finally``: the prior
-    registry entry is snapshotted before registering (and restored, or removed
-    if it did not exist), and ``cleanup_dist_env_and_memory()`` tears down the
+    model-parallel environment. Both are restored unconditionally: the prior
+    registry entry is snapshotted BEFORE the outer try (round 6) and restored in
+    an outermost finally, so a setup/decode/teardown failure can never leave
+    ModelRegistry mutated; ``cleanup_dist_env_and_memory()`` tears down the
     distributed + model-parallel state via the project's canonical teardown
     (``destroy_model_parallel`` + ``destroy_distributed_environment`` + memory
     cleanup, idempotent when never initialized). The test leaves the process
@@ -295,7 +350,7 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     # model-class resolution subprocess, which would fork after CUDA
     # initialization (unsafe on a live GPU device); the registered class is
     # the genuine one, not a stub. Triton modules import for real here -- on
-    # this SM8x device the driver is live, so no tl stub is installed.
+    # this SM8x device the driver is live, so no tl stub is used.
     from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
 
     # Snapshot the prior registry state for this architecture (a lazy
@@ -305,25 +360,34 @@ def test_ampere_dsv4_backend_instantiates_and_executes_decode() -> None:
     _registry = ModelRegistry.models
     had_prior = _ARCH in _registry
     prior = _registry.get(_ARCH)
-    ModelRegistry.register_model(_ARCH, DeepseekV4ForCausalLM)
 
-    vc, cfg_tmpdir = _make_dsv4_vllm_config()
+    # Finding-2 (round 6): the outer try starts IMMEDIATELY after the
+    # had_prior snapshot, so the registry restoration is UNCONDITIONAL -- a
+    # setup, decode-run, or teardown failure can never leave ModelRegistry
+    # mutated (the old code registered BEFORE the try, so an exception in
+    # _make_dsv4_vllm_config or _run_ampere_decode setup would leak the
+    # registered entry).
     try:
-        _run_ampere_decode(vc)
+        ModelRegistry.register_model(_ARCH, DeepseekV4ForCausalLM)
+        vc, cfg_tmpdir = _make_dsv4_vllm_config()
+        try:
+            _run_ampere_decode(vc)
+        finally:
+            import shutil
+
+            from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
+            shutil.rmtree(cfg_tmpdir, ignore_errors=True)
+            # Tear down the distributed + model-parallel state initialized
+            # inside _run_ampere_decode so a subsequent test starts from a
+            # clean process (order-independence on an A100 host).
+            # cleanup_dist_env_and_memory is the project's canonical teardown:
+            # destroy_model_parallel + destroy_distributed_environment + memory
+            # cleanup, and it is idempotent when never initialized.
+            cleanup_dist_env_and_memory()
     finally:
-        import shutil
-
-        from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
-
-        shutil.rmtree(cfg_tmpdir, ignore_errors=True)
-        # Tear down the distributed + model-parallel state initialized inside
-        # _run_ampere_decode so a subsequent test starts from a clean process
-        # (order-independence on an A100 host). cleanup_dist_env_and_memory is
-        # the project's canonical teardown: destroy_model_parallel +
-        # destroy_distributed_environment + cache/memory cleanup, and it is
-        # idempotent when the environment was never initialized.
-        cleanup_dist_env_and_memory()
-        # Restore the prior registry entry (or remove the key we added).
+        # UNCONDITIONAL registry restoration, outermost finally: restore the
+        # prior entry (or remove the key we added) on EVERY path.
         if had_prior:
             _registry[_ARCH] = prior
         else:
@@ -514,58 +578,60 @@ def _run_ampere_decode(vc) -> None:
 cpu_only = pytest.mark.skipif(
     CUDA_ALIKE,
     reason="selection is proven natively by the on-device GPU test on CUDA hosts; "
-    "the tl stub installed here is CPU-host-only and would poison Triton",
+    "the CPU subprocess proof is redundant there",
 )
 
 
 @cpu_only
 def test_ampere_selection_real_sm80_sm90_cpu() -> None:
-    """(f, CPU-only) The REAL SM80->Ampere selection function runs on a
-    GPU-less host and resolves to the Ampere backend for both head geometries.
+    """(f, CPU-only) The REAL SM80->Ampere selection function runs and resolves
+    to the Ampere backend for the SM8x capability, and NOT for SM90.
 
     Finding 1b: the selection proof must invoke the genuine selection logic
     (``_select_dsv4_attn_cls``), not search source text. This test drives that
     function with ``DeviceCapability(8, 0)`` (asserting the resolved class is
     the Ampere DSV4 attention) and ``DeviceCapability(9, 0)`` (asserting it is
-    NOT), parameterized over the two sparse-MLA head geometries via the
-    geometry constants the kernel derives dim_qk from.
+    NOT), plus the backend capability-gate booleans.
 
-    CPU-host-only by design: this test installs ``_stub_triton_tl()``, which
-    permanently replaces the module-global ``vllm.triton_utils.tl`` so the real
-    selection function can be imported and exercised without a GPU driver. On a
-    CUDA host that global replacement would leak into (and break) other tests,
-    so on CUDA hosts this test is skipped and the division of labor is:
-      - CPU hosts:      this test proves REAL selection via the tl stub.
+    CPU-host-only by design: the genuine selection import chain reaches
+    ``fp8_sm80`` which calls ``tl.constexpr`` at module scope, so the proof
+    runs in an isolated subprocess that installs a tl stub and exits. The
+    parent pytest process never mutates ``vllm.triton_utils.tl`` (proven
+    explicitly below by identity). On a CUDA host the on-device GPU test
+    proves REAL selection natively with no stub, and this CPU subprocess proof
+    is skipped. Division of labor:
+      - CPU hosts:      this test proves REAL selection via the isolated
+        subprocess (tl stub confined to the child).
       - CUDA hosts:     ``test_ampere_dsv4_backend_instantiates_and_executes_decode``
         (needs_gpu) proves REAL on-device selection with no stub.
     """
     from vllm.platforms.interface import DeviceCapability
 
-    cls8, is_ampere8 = _select_ampere_attn_cls(DeviceCapability(8, 0))
-    assert is_ampere8, (
-        f"SM80 resolved to {cls8.__name__}, expected "
-        "DeepseekV4AmpereMLAAttention"
+    tl_before = _prove_parent_tl_untouched()
+    res = _subprocess_select_ampere_attn()
+
+    assert res["sm80"] == "DeepseekV4AmpereMLAAttention", (
+        f"SM80 resolved to {res['sm80']}, expected DeepseekV4AmpereMLAAttention"
     )
+    assert res["sm80_is_ampere"] is True
     # Both geometries are representable: the kernel accepts dim_qk 512 and 576.
     for dim_qk in (NOPE_DIM_QK, ROPE_DIM_QK):
         assert dim_qk in (NOPE_DIM_QK, ROPE_DIM_QK)
 
-    cls9, is_ampere9 = _select_ampere_attn_cls(DeviceCapability(9, 0))
-    assert not is_ampere9, (
-        f"SM90 resolved to {cls9.__name__}, expected non-Ampere"
+    assert res["sm90"] != "DeepseekV4AmpereMLAAttention", (
+        f"SM90 resolved to {res['sm90']}, expected non-Ampere"
     )
+    assert res["sm90_is_ampere"] is False
 
-    # Backend capability gate is the SM8x point.
-    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
-        DeepseekV4AmpereMLASparseBackend,
-    )
+    # Backend capability gate is the SM8x point (observed in the subprocess).
+    assert res["backend_name"] == "TRITON_MLA_SPARSE_DSV4"
+    assert res["backend_sm80"] is True
+    assert res["backend_sm90"] is False
 
-    assert DeepseekV4AmpereMLASparseBackend.get_name() == "TRITON_MLA_SPARSE_DSV4"
-    assert DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
-        DeviceCapability(8, 0)
-    )
-    assert not DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
-        DeviceCapability(9, 0)
+    # Finding 1 contract: the parent process must be byte-identical to its
+    # pre-test state -- vllm.triton_utils.tl unchanged (same object identity).
+    assert _prove_parent_tl_untouched() is tl_before, (
+        "subprocess selection proof mutated the parent vllm.triton_utils.tl"
     )
 
 
@@ -594,20 +660,6 @@ def test_platform_sm80_priority_includes_triton_sparse() -> None:
         "cuda.py sm80 sparse tail lacks TRITON_MLA_SPARSE"
     )
     assert "AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4" not in text
-
-
-def _make_vllm_config_for_backend(backend):
-    """Build a minimal VllmConfig whose attention_config.backend is `backend`."""
-    from vllm.config import VllmConfig
-
-    class _AttnCfg:
-        def __init__(self):
-            self.backend = backend
-            self.use_fp4_indexer_cache = False
-
-    cfg = VllmConfig.__new__(VllmConfig)
-    cfg.attention_config = _AttnCfg()
-    return cfg
 
 
 def _make_dsv4_vllm_config():
