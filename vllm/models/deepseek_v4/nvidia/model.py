@@ -12,6 +12,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
+from vllm.logger import init_logger
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,

@@ -53,56 +53,6 @@ needs_gpu = pytest.mark.skipif(
 )
 
 
-def _install_dsv4_model_import_hook():
-    """Work around the step-4 merge regression in
-    ``vllm.models.deepseek_v4.nvidia.model``: it uses ``init_logger`` without
-    importing it (``from vllm.logger import init_logger`` was dropped in the
-    step-4 remainder merge). The missing symbol makes the whole module (and
-    therefore the Ampere backend chain) unimportable on ANY host. We inject the
-    real ``init_logger`` into the module globals before exec so the genuine
-    selection function ``_select_dsv4_attn_cls`` can be exercised on CPU.
-
-    This is a test-side workaround; the production regression must be fixed in
-    ``vllm/models/deepseek_v4/nvidia/model.py`` (add the missing import).
-    """
-    import importlib.abc
-    import importlib.machinery
-
-    if _install_dsv4_model_import_hook.installed:
-        return
-    from vllm.logger import init_logger
-
-    _REAL = "vllm.models.deepseek_v4.nvidia.model"
-
-    class _Inject(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if fullname == _REAL:
-                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
-                if spec is None:
-                    return None
-                orig = spec.loader
-
-                class _Loader(importlib.abc.Loader):
-                    def create_module(self, spec):
-                        return None
-
-                    def exec_module(self, module):
-                        module.__dict__.setdefault("init_logger", init_logger)
-                        orig.exec_module(module)
-
-                spec.loader = _Loader()
-                return spec
-            return None
-
-    import sys
-
-    sys.meta_path.insert(0, _Inject())
-    _install_dsv4_model_import_hook.installed = True
-
-
-_install_dsv4_model_import_hook.installed = False
-
-
 def _stub_triton_tl():
     """Make ``vllm.triton_utils.tl`` import-safe on a CPU-only host.
 
@@ -138,7 +88,6 @@ def _select_ampere_attn_cls(device_capability):
     ``_select_dsv4_attn_cls`` (not a source-text search) after installing the
     import hook and tl stub.
     """
-    _install_dsv4_model_import_hook()
     _stub_triton_tl()
     from vllm.models.deepseek_v4.ampere.ampere_sparse import (
         DeepseekV4AmpereMLAAttention,
@@ -303,7 +252,6 @@ def test_ampere_dsv4_backend_selected_and_executes_on_sm80(monkeypatch) -> None:
     The kernel-execution body is what the GPU skip guard protects; selection
     itself is proven on CPU in ``test_ampere_selection_real_sm80_sm90_cpu``.
     """
-    _install_dsv4_model_import_hook()
     _stub_triton_tl()
     import torch
 
