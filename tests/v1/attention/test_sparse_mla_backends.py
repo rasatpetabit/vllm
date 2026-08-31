@@ -2369,10 +2369,14 @@ def test_task12_cuda_gated_bootstrap_leaves_actual_globals_unchanged():
     # Post-collection residue must match the pre-collection actual state
     # (the collection-time bootstrap restored byte-for-byte). This is a
     # direct check: running the full install+restore cycle leaves the real
-    # globals identical to the pristine baseline.
+    # globals identical to the pristine baseline. The restore is guarded on
+    # the install flag exactly like the module bootstrap: on a CUDA host the
+    # install captures nothing, and an unguarded restore would write the
+    # uncaptured _STUB_TL_STATE (None) into vllm.triton_utils.tl.
     baseline = _snapshot_actual_globals()
-    _install_cpu_stubs()
-    _restore_cpu_stubs()
+    installed = _install_cpu_stubs()
+    if installed:
+        _restore_cpu_stubs()
     _assert_globals_unchanged(baseline, _snapshot_actual_globals())
 
 
