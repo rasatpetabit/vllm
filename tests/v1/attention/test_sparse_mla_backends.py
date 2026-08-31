@@ -4,15 +4,23 @@
 
 import math
 
-# --- CPU bootstrap -------------------------------------------------------
+# --- CPU bootstrap (fully restoring, platform-gated) ---------------------
 # On a CPU-only host the native ``_C_stable_libtorch`` extension and the
 # Triton language runtime are unavailable, which would make the module
 # below uncollectable at import time (``fp8_sm80`` calls ``tl.constexpr`` at
 # module scope). The backend-SELECTION logic (auto / forced / issue-54059
-# regression) must run on every host, so on hosts without usable CUDA install
-# minimal stubs for those two module-scope GPU dependencies, then gate every
-# hardware-execution test with ``@cuda_required`` below. On CUDA hosts
-# nothing is installed here and the real extensions load normally.
+# regression) must run on every host, so on hosts without CUDA we install
+# minimal stubs for the three module-scope GPU dependencies -- then RESTORE
+# every mutated global byte-for-byte (identity) before the module body
+# continues, so no later test in the same pytest process sees the stubs.
+#
+# The gate is ``current_platform.is_cuda()`` (the vLLM platform), NOT
+# ``torch.cuda.is_available()``: the platform is what the production
+# selection path actually consults, so a CUDA-platform host with transiently
+# unavailable Torch CUDA must still load the real extensions, never the
+# stubs. ``test_task12_cpu_bootstrap_restores_globals`` proves the restore
+# is byte-identical, and ``test_task12_stub_path_never_runs_on_cuda`` proves
+# the stub path is skipped on a CUDA platform.
 import sys as _sys
 import types as _types
 from types import MethodType, SimpleNamespace
@@ -20,46 +28,107 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-if not torch.cuda.is_available():
-    _sys.modules.setdefault(
-        "vllm._C_stable_libtorch",
-        _types.ModuleType("vllm._C_stable_libtorch"),
-    )
-    _sys.modules.setdefault(
-        "vllm._moe_C_stable_libtorch",
-        _types.ModuleType("vllm._moe_C_stable_libtorch"),
-    )
+# The module-scope GPU dependencies the CPU bootstrap may need to stub.
+_STUB_MODULE_NAMES = (
+    "vllm._C_stable_libtorch",
+    "vllm._moe_C_stable_libtorch",
+)
+_STUB_MODULES_STATE: dict[str, object | None] = {}
+_STUB_TL_STATE: object | None = None
+
+try:
     import vllm.triton_utils as _tu
-
-    _tu.tl = _types.SimpleNamespace(
-        constexpr=lambda v: v,
-        int32=lambda v: v,
-        float32=lambda v: v,
-        int64=lambda v: v,
-    )
+except Exception:  # pragma: no cover - vllm is importable in all test hosts
+    _tu = None
 
 
-from tests.v1.attention.test_mla_backends import (
+# Collection-time bootstrap. It runs ONCE at import, installs stubs only when
+# the vLLM platform reports no CUDA, imports the modules that need the stubs
+# to be collectable, then restores every global it touched.
+def _install_cpu_stubs() -> bool:
+    """Install the minimal stubs. Returns True if stubs were installed.
+
+    Only ever installs on a non-CUDA vLLM platform. On CUDA (or any other
+    accelerated platform) this returns False and mutates nothing, so the
+    real extensions always load. The state dicts are only written when a
+    stub is actually installed, so a CUDA-gated call never leaves residue.
+    """
+    global _STUB_TL_STATE
+    from vllm.platforms import current_platform  # lazy: needs no stub
+
+    if current_platform.is_cuda():
+        return False
+    for name in _STUB_MODULE_NAMES:
+        _STUB_MODULES_STATE[name] = _sys.modules.get(name)
+    _STUB_TL_STATE = _tu.tl if _tu is not None else None
+    for name in _STUB_MODULE_NAMES:
+        if name not in _sys.modules:
+            _sys.modules[name] = _types.ModuleType(name)
+    if _tu is not None:
+        _tu.tl = _types.SimpleNamespace(
+            constexpr=lambda v: v,
+            int32=lambda v: v,
+            float32=lambda v: v,
+            int64=lambda v: v,
+        )
+    return True
+
+
+def _restore_cpu_stubs() -> None:
+    """Restore every global the bootstrap touched, byte-for-byte.
+
+    ``_STUB_MODULES_STATE`` / ``_STUB_TL_STATE`` snapshot the pre-bootstrap
+    identity (or absence). Restoring the exact same objects (identity, not
+    copy) guarantees later tests see the pristine globals.
+    """
+    global _STUB_TL_STATE
+    if _tu is not None:
+        _tu.tl = _STUB_TL_STATE
+    for name, prev in _STUB_MODULES_STATE.items():
+        if prev is None:
+            _sys.modules.pop(name, None)
+        else:
+            _sys.modules[name] = prev
+    _STUB_MODULES_STATE.clear()
+    _STUB_TL_STATE = None
+
+
+_install_cpu_stubs()  # collection-time bootstrap; restores below
+try:
+    # The two sparse backend modules call ``tl.constexpr`` at module scope;
+    # with Triton disabled (no GPU driver) that raises. Import them under the
+    # stub so the rest of this module can reference them at collection time.
+    import vllm.platforms.cuda  # noqa: E402,F401  (pulls _C_stable_libtorch)
+    import vllm.v1.attention.backends.mla.flashinfer_mla_sparse  # noqa: E402,F401
+    import vllm.v1.attention.backends.mla.flashmla_sparse  # noqa: E402,F401
+    import vllm.v1.attention.backends.mla.triton_mla_sparse  # noqa: E402,F401
+finally:
+    _restore_cpu_stubs()
+
+
+from tests.v1.attention.test_mla_backends import (  # noqa: E402
     BATCH_SPECS,
     BatchSpec,
     MockSparseMLAAttentionLayer,
     create_and_prepopulate_kv_cache,
 )
-from tests.v1.attention.utils import (
+from tests.v1.attention.utils import (  # noqa: E402
     create_common_attn_metadata,
     create_standard_kv_cache_spec,
     create_vllm_config,
 )
-from vllm import _custom_ops as ops
-from vllm.config import set_current_vllm_config
-from vllm.model_executor.layers.attention.mla_attention import _use_masked_mha
-from vllm.model_executor.layers.attention.sparse_mla_attention import (
+from vllm import _custom_ops as ops  # noqa: E402
+from vllm.config import set_current_vllm_config  # noqa: E402
+from vllm.model_executor.layers.attention.mla_attention import (  # noqa: E402
+    _use_masked_mha,
+)
+from vllm.model_executor.layers.attention.sparse_mla_attention import (  # noqa: E402
     GLOBAL_TOPK_MASK_MAX_BYTES,
     _masked_mha_workspace_fits,
     _topk_mask_shape,
 )
-from vllm.model_executor.layers.linear import ColumnParallelLinear
-from vllm.platforms import current_platform
+from vllm.model_executor.layers.linear import ColumnParallelLinear  # noqa: E402
+from vllm.platforms import current_platform  # noqa: E402
 
 # TODO: Integrate ROCMAiterMLASparseBackend for ROCm.
 # The ROCm sparse MLA backend (rocm_aiter_mla_sparse.py) has a compatible
@@ -1841,11 +1910,23 @@ from vllm.v1.attention.backends.registry import (  # noqa: E402
 from vllm.v1.attention.selector import AttentionSelectorConfig  # noqa: E402
 
 
-def _sparse_selection(capability: DeviceCapability, head_size: int, **kw):
+def _sparse_selection(
+    capability: DeviceCapability,
+    head_size: int,
+    kv_cache_dtype: str = "auto",
+    **kw,
+):
+    """Run the REAL selection machinery for a capability/head-size/kv dtype.
+
+    ``kv_cache_dtype`` is an explicit parameter (default ``"auto"``) rather
+    than a ``**kw`` passthrough, so the issue-54059 regression matrix can
+    vary it without the duplicate-key ``TypeError`` that ``**kw`` would raise
+    (``AttentionSelectorConfig`` already names the field).
+    """
     cfg = AttentionSelectorConfig(
         head_size=head_size,
         dtype=torch.bfloat16,
-        kv_cache_dtype="auto",
+        kv_cache_dtype=kv_cache_dtype,
         block_size=64,
         use_mla=True,
         use_sparse=True,
@@ -1981,27 +2062,119 @@ def test_task12_issue54059_regression_never_raises():
     """Regression for vllm-project/vllm#54059 (sm8x head_size=512 sparse-MLA
     backend-selection failure).
 
-    For every sm8x capability and both head sizes, selection must NEVER raise:
-    it either resolves a usable backend or returns structured invalid reasons.
-    The resolved backend, when present, must be the portable TRITON_MLA_SPARSE
-    (the sm80 path for glm5next/GLM-5.3), and the SM90/FlashMLA sparse entries
-    must be rejected as invalid reasons, not crash.
+    Full capability x head_size x kv_cache_dtype matrix. For every combo,
+    selection must NEVER raise: it either resolves a usable backend or
+    returns structured invalid reasons. The resolved backend, when present,
+    must be the portable TRITON_MLA_SPARSE (the sm80 path for
+    glm5next/GLM-5.3), and the SM90/FlashMLA sparse entries must be rejected
+    as invalid reasons, not crash.
+
+    kv_cache_dtype is varied explicitly (auto / bfloat16 / fp8 / fp8_ds_mla).
+    fp8 and fp8_ds_mla are rejected by TRITON_MLA_SPARSE (which only serves
+    [auto, bfloat16]): that rejection is BY DESIGN -- the matrix asserts a
+    structured invalid-reason entry, never an exception.
     """
+    kv_cache_dtypes = ["auto", "bfloat16", "fp8", "fp8_ds_mla"]
     for cap in (
         DeviceCapability(8, 0),
         DeviceCapability(8, 6),
         DeviceCapability(8, 9),
     ):
         for hs in (512, 576):
-            valid, invalid, _ = _sparse_selection(cap, hs)
-            # Never raises is the contract; reaching here proves it.
-            if valid:
-                assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], (
-                    f"cap={cap} hs={hs} resolved {valid}"
-                )
-            else:
-                # No usable backend: must be a structured invalid-reason
-                # dictionary, and TRITON_MLA_SPARSE must be present with a
-                # concrete reason (so a future capability/head-size regression
-                # that silently drops the sm80 path is caught).
-                assert AttentionBackendEnum.TRITON_MLA_SPARSE in invalid
+            for kv in kv_cache_dtypes:
+                valid, invalid, _ = _sparse_selection(cap, hs, kv)
+                # Never raises is the contract; reaching here proves it.
+                if valid:
+                    assert valid == [AttentionBackendEnum.TRITON_MLA_SPARSE], (
+                        f"cap={cap} hs={hs} kv={kv} resolved {valid}"
+                    )
+                else:
+                    # No usable backend: must be a structured invalid-reason
+                    # dictionary, and TRITON_MLA_SPARSE must be present with a
+                    # concrete reason (so a future capability/head-size
+                    # regression that silently drops the sm80 path is caught).
+                    assert AttentionBackendEnum.TRITON_MLA_SPARSE in invalid, (
+                        f"cap={cap} hs={hs} kv={kv}: Triton sparse dropped"
+                    )
+                    assert _selection_invalid_reason(
+                        AttentionBackendEnum.TRITON_MLA_SPARSE,
+                        invalid,
+                        "kv_cache_dtype",
+                    ), invalid
+
+
+def test_task12_cpu_bootstrap_restores_globals():
+    """The CPU-only bootstrap must restore every global it touched.
+
+    This test runs in the SAME pytest process as the rest of the module, so
+    it directly proves the restore contract: after the collection-time
+    bootstrap ran (and any later re-invocation below), ``vllm.triton_utils.tl``
+    and the two stub module entries are byte-identical (by identity) to their
+    pristine pre-bootstrap values.
+    """
+    import sys
+
+    import vllm.triton_utils as tu
+    from vllm.platforms import current_platform
+
+    # Snapshot pristine state.
+    orig_tl = tu.tl
+    orig_mods = {
+        name: sys.modules.get(name) for name in _STUB_MODULE_NAMES
+    }
+
+    # Re-run the bootstrap exactly as at collection time, then restore.
+    installed = _install_cpu_stubs()
+    try:
+        # Exercise the full import surface the bootstrap protects.
+        import vllm.v1.attention.backends.mla.flashinfer_mla_sparse  # noqa: F401
+        import vllm.v1.attention.backends.mla.flashmla_sparse  # noqa: F401
+    finally:
+        _restore_cpu_stubs()
+
+    # Identity assertions: the exact same objects must be back in place.
+    assert tu.tl is orig_tl, "vllm.triton_utils.tl was not restored"
+    for name, prev in orig_mods.items():
+        assert sys.modules.get(name) is prev, (
+            f"sys.modules[{name!r}] was not restored to its pre-bootstrap object"
+        )
+
+    # And the stub path must not have run on this host's platform in a way
+    # that left any residue: if we're on CUDA it must never have installed.
+    if current_platform.is_cuda():
+        assert installed is False, "stubs must never install on a CUDA platform"
+
+
+def test_task12_stub_path_never_runs_on_cuda():
+    """On a CUDA platform the stub-install path must never execute.
+
+    The bootstrap is gated on ``current_platform.is_cuda()`` (the vLLM
+    platform), NOT ``torch.cuda.is_available()``. This proves that even a
+    CUDA-platform host with transiently unavailable Torch CUDA would load the
+    real extensions: ``_install_cpu_stubs`` returns False and mutates nothing
+    when the platform reports CUDA.
+    """
+    from unittest import mock
+
+    from vllm.platforms import current_platform
+
+    # Snapshot current residue, whatever it is (on a CPU host the
+    # collection-time bootstrap legitimately installed stubs; on a CUDA host
+    # it never did).
+    state_before = dict(_STUB_MODULES_STATE)
+    tl_before = _STUB_TL_STATE
+
+    if not current_platform.is_cuda():
+        # CPU host: directly assert the gate by simulating a CUDA platform.
+        with mock.patch.object(
+            current_platform, "is_cuda", return_value=True
+        ):
+            assert _install_cpu_stubs() is False
+        # A CUDA-gated call must never add or change residue.
+        assert state_before == _STUB_MODULES_STATE
+        assert _STUB_TL_STATE is tl_before
+    else:
+        # Real CUDA host: the stub path must simply never have installed.
+        assert _install_cpu_stubs() is False
+        assert _STUB_MODULES_STATE == {}
+        assert _STUB_TL_STATE is None
