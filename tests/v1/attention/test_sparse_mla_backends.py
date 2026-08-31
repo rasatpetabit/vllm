@@ -33,7 +33,12 @@ _STUB_MODULE_NAMES = (
     "vllm._C_stable_libtorch",
     "vllm._moe_C_stable_libtorch",
 )
-_STUB_MODULES_STATE: dict[str, object | None] = {}
+# Sentinel distinguishing "entry/attr absent" from "present-as-None" when
+# snapshotting sys.modules / vllm.triton_utils.tl. sys.modules.get() would
+# conflate the two, breaking restore for pre-existing None entries.
+_ABSENT = object()
+
+_STUB_MODULES_STATE: dict[str, object] = {}
 _STUB_TL_STATE: object | None = None
 
 try:
@@ -59,8 +64,10 @@ def _install_cpu_stubs() -> bool:
     if current_platform.is_cuda():
         return False
     for name in _STUB_MODULE_NAMES:
-        _STUB_MODULES_STATE[name] = _sys.modules.get(name)
-    _STUB_TL_STATE = _tu.tl if _tu is not None else None
+        _STUB_MODULES_STATE[name] = _sys.modules.get(name, _ABSENT)
+    _STUB_TL_STATE = (
+        _ABSENT if _tu is None else getattr(_tu, "tl", _ABSENT)
+    )
     for name in _STUB_MODULE_NAMES:
         if name not in _sys.modules:
             _sys.modules[name] = _types.ModuleType(name)
@@ -82,10 +89,19 @@ def _restore_cpu_stubs() -> None:
     copy) guarantees later tests see the pristine globals.
     """
     global _STUB_TL_STATE
-    if _tu is not None:
+    if _STUB_TL_STATE is _ABSENT:
+        # tl was ABSENT before: delete it back out. Guard on absence (not
+        # falsiness) so a pre-existing present-as-None is restored, not
+        # deleted.
+        if _tu is not None and hasattr(_tu, "tl"):
+            delattr(_tu, "tl")
+    elif _tu is not None:
+        # Present before (object or None): put the exact same value back.
         _tu.tl = _STUB_TL_STATE
     for name, prev in _STUB_MODULES_STATE.items():
-        if prev is None:
+        if prev is _ABSENT:
+            # Absent before: pop it back out (present-as-None is preserved
+            # by the else branch).
             _sys.modules.pop(name, None)
         else:
             _sys.modules[name] = prev
@@ -2106,21 +2122,23 @@ def test_task12_issue54059_regression_never_raises():
 def test_task12_cpu_bootstrap_restores_globals():
     """The CPU-only bootstrap must restore every global it touched.
 
-    This test runs in the SAME pytest process as the rest of the module, so
-    it directly proves the restore contract: after the collection-time
-    bootstrap ran (and any later re-invocation below), ``vllm.triton_utils.tl``
-    and the two stub module entries are byte-identical (by identity) to their
-    pristine pre-bootstrap values.
+    This runs in the SAME pytest process as the rest of the module, so it
+    directly proves the restore contract: after the collection-time bootstrap
+    ran (and any later re-invocation below), ``vllm.triton_utils.tl`` and the
+    two stub module entries are byte-identical (by identity) to their
+    pristine pre-bootstrap values. The snapshots read the ACTUAL globals
+    (``sys.modules`` / ``getattr(tu, 'tl')``) rather than the bootstrap's
+    bookkeeping dicts.
     """
     import sys
 
     import vllm.triton_utils as tu
     from vllm.platforms import current_platform
 
-    # Snapshot pristine state.
-    orig_tl = tu.tl
+    # Snapshot pristine ACTUAL state (distinguishing absent from None).
+    orig_tl = getattr(tu, "tl", _ABSENT)
     orig_mods = {
-        name: sys.modules.get(name) for name in _STUB_MODULE_NAMES
+        name: sys.modules.get(name, _ABSENT) for name in _STUB_MODULE_NAMES
     }
 
     # Re-run the bootstrap exactly as at collection time, then restore.
@@ -2132,10 +2150,13 @@ def test_task12_cpu_bootstrap_restores_globals():
     finally:
         _restore_cpu_stubs()
 
-    # Identity assertions: the exact same objects must be back in place.
-    assert tu.tl is orig_tl, "vllm.triton_utils.tl was not restored"
+    # Identity assertions on the ACTUAL globals: the exact same objects (or
+    # the same absence) must be back in place.
+    assert getattr(tu, "tl", _ABSENT) is orig_tl, (
+        "vllm.triton_utils.tl was not restored"
+    )
     for name, prev in orig_mods.items():
-        assert sys.modules.get(name) is prev, (
+        assert sys.modules.get(name, _ABSENT) is prev, (
             f"sys.modules[{name!r}] was not restored to its pre-bootstrap object"
         )
 
@@ -2143,6 +2164,173 @@ def test_task12_cpu_bootstrap_restores_globals():
     # that left any residue: if we're on CUDA it must never have installed.
     if current_platform.is_cuda():
         assert installed is False, "stubs must never install on a CUDA platform"
+
+
+def _snapshot_actual_globals():
+    """Snapshot the REAL globals the bootstrap touches, as (value, absent?) pairs.
+
+    Returns ``(mods, tl)`` where ``mods`` maps each stub module name to
+    ``(value, was_absent)`` and ``tl`` is ``(value, was_absent)``. "absent"
+    is tracked separately because ``sys.modules`` may legitimately contain a
+    ``None`` entry and ``tl`` may be present-as-``None``.
+    """
+    import sys
+
+    mods = {
+        name: (sys.modules.get(name, _ABSENT), name not in sys.modules)
+        for name in _STUB_MODULE_NAMES
+    }
+    if _tu is None:
+        tl_value = _ABSENT
+        tl_absent = True
+    else:
+        tl_value = getattr(_tu, "tl", _ABSENT)
+        tl_absent = not hasattr(_tu, "tl")
+    return mods, (tl_value, tl_absent)
+
+
+def _restore_actual_globals(pristine):
+    """Restore the ACTUAL globals to a captured pristine snapshot.
+
+    Puts back exact identities (or absence) so a test is fully
+    order-independent regardless of what prior globals were.
+    """
+    import sys
+
+    mods, (tl_val, tl_absent) = pristine
+    for name in _STUB_MODULE_NAMES:
+        (val, was_absent) = mods[name]
+        if was_absent:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = val
+    if _tu is not None:
+        if tl_absent:
+            if hasattr(_tu, "tl"):
+                delattr(_tu, "tl")
+        else:
+            _tu.tl = tl_val
+
+
+def _assert_globals_unchanged(before, after):
+    """Assert the ACTUAL globals after == before, identity-preserving."""
+    mods_before, (tl_before, tl_absent_before) = before
+    mods_after, (tl_after, tl_absent_after) = after
+
+    # sys.modules entries: identity (or the same absence) must hold.
+    for name in _STUB_MODULE_NAMES:
+        (v_before, absent_before) = mods_before[name]
+        (v_after, absent_after) = mods_after[name]
+        assert absent_after is absent_before, (
+            f"sys.modules[{name!r}] presence flipped"
+        )
+        assert v_after is v_before, (
+            f"sys.modules[{name!r}] value identity changed"
+        )
+
+    # vllm.triton_utils.tl: identity (or the same absence) must hold.
+    assert tl_absent_after is tl_absent_before, (
+        "vllm.triton_utils.tl presence flipped"
+    )
+    assert tl_after is tl_before, (
+        "vllm.triton_utils.tl value identity changed"
+    )
+
+
+def test_task12_cuda_gated_bootstrap_leaves_actual_globals_unchanged():
+    """A CUDA-gated ``_install_cpu_stubs()`` must not mutate the real globals.
+
+    Covers the three cases for each global explicitly: (a) absent before,
+    (b) present-as-``None`` before, (c) present-with-object before (identity
+    preserved). Each case asserts the ACTUAL ``sys.modules`` entry and
+    ``vllm.triton_utils.tl`` attribute, not the bootstrap's bookkeeping.
+    """
+    from unittest import mock
+
+    from vllm.platforms import current_platform
+
+    import sys  # isort:skip (local helper needs stdlib before vllm imports)
+
+    def _case(name, mutate, assert_setup):
+        """Run one sub-case: set up a prior global state, then verify a
+        CUDA-gated ``_install_cpu_stubs()`` leaves the ACTUAL globals exactly
+        as they were.
+
+        Each case snapshots the pristine baseline, applies its own ``mutate``,
+        proves the setup took effect (``assert_setup``), calls the CUDA-gated
+        install, asserts the real globals are unchanged, then restores the
+        pristine baseline so the suite stays order-independent.
+        """
+        pristine = _snapshot_actual_globals()
+        try:
+            mutate()
+            assert_setup()  # prove this case's prior state is genuinely in place
+            before = _snapshot_actual_globals()
+            with mock.patch.object(
+                current_platform, "is_cuda", return_value=True
+            ):
+                assert _install_cpu_stubs() is False
+            after = _snapshot_actual_globals()
+            _assert_globals_unchanged(before, after)
+        finally:
+            _restore_actual_globals(pristine)
+
+    # (a) Absent before: every stub module entry and tl are absent.
+    def _absent():
+        for name in _STUB_MODULE_NAMES:
+            sys.modules.pop(name, None)
+        if _tu is not None and hasattr(_tu, "tl"):
+            delattr(_tu, "tl")
+
+    def _assert_absent():
+        for name in _STUB_MODULE_NAMES:
+            assert name not in sys.modules, f"{name} should be absent"
+        assert not hasattr(_tu, "tl"), "tl should be absent"
+
+    _case("absent", _absent, _assert_absent)
+
+    # (b) Present-as-None before: entries exist with value None.
+    def _none():
+        for name in _STUB_MODULE_NAMES:
+            sys.modules[name] = None
+        if _tu is not None:
+            _tu.tl = None
+
+    def _assert_none():
+        for name in _STUB_MODULE_NAMES:
+            assert name in sys.modules, f"{name} should be present"
+            assert sys.modules[name] is None, f"{name} should be None"
+        assert hasattr(_tu, "tl") and _tu.tl is None, "tl should be present-None"
+
+    _case("present-none", _none, _assert_none)
+
+    # (c) Present-with-object before (identity must be preserved).
+    obj = object()
+    mod_obj = {name: object() for name in _STUB_MODULE_NAMES}
+
+    def _objects():
+        for name in _STUB_MODULE_NAMES:
+            sys.modules[name] = mod_obj[name]
+        if _tu is not None:
+            _tu.tl = obj
+
+    def _assert_objects():
+        for name in _STUB_MODULE_NAMES:
+            assert sys.modules[name] is mod_obj[name], (
+                f"{name} identity setup broken"
+            )
+        assert _tu.tl is obj, "tl identity setup broken"
+
+    _case("present-object", _objects, _assert_objects)
+
+    # Post-collection residue must match the pre-collection actual state
+    # (the collection-time bootstrap restored byte-for-byte). This is a
+    # direct check: running the full install+restore cycle leaves the real
+    # globals identical to the pristine baseline.
+    baseline = _snapshot_actual_globals()
+    _install_cpu_stubs()
+    _restore_cpu_stubs()
+    _assert_globals_unchanged(baseline, _snapshot_actual_globals())
 
 
 def test_task12_stub_path_never_runs_on_cuda():
@@ -2158,23 +2346,31 @@ def test_task12_stub_path_never_runs_on_cuda():
 
     from vllm.platforms import current_platform
 
-    # Snapshot current residue, whatever it is (on a CPU host the
-    # collection-time bootstrap legitimately installed stubs; on a CUDA host
-    # it never did).
-    state_before = dict(_STUB_MODULES_STATE)
-    tl_before = _STUB_TL_STATE
+    import sys  # isort:skip (local helper needs stdlib before vllm imports)
 
     if not current_platform.is_cuda():
-        # CPU host: directly assert the gate by simulating a CUDA platform.
+        # CPU host: directly assert the gate by simulating a CUDA platform,
+        # and assert the ACTUAL globals (sys.modules entries and
+        # vllm.triton_utils.tl) are unchanged.
+        before = _snapshot_actual_globals()
         with mock.patch.object(
             current_platform, "is_cuda", return_value=True
         ):
             assert _install_cpu_stubs() is False
-        # A CUDA-gated call must never add or change residue.
-        assert state_before == _STUB_MODULES_STATE
-        assert _STUB_TL_STATE is tl_before
+        _assert_globals_unchanged(before, _snapshot_actual_globals())
     else:
-        # Real CUDA host: the stub path must simply never have installed.
+        # Real CUDA host: the stub path must simply never have installed, so
+        # the actual modules must not be stub modules and tl must be the real
+        # triton.tl (absent or present as the real object).
         assert _install_cpu_stubs() is False
-        assert _STUB_MODULES_STATE == {}
-        assert _STUB_TL_STATE is None
+        for name in _STUB_MODULE_NAMES:
+            entry = sys.modules.get(name, _ABSENT)
+            assert entry is _ABSENT or not isinstance(
+                entry, _types.ModuleType
+            ) or entry.__name__ != name, (
+                f"stub module {name!r} must never be installed on CUDA"
+            )
+        if _tu is not None:
+            assert not hasattr(_tu, "tl") or not isinstance(
+                _tu.tl, _types.SimpleNamespace
+            ), "stub tl must never be installed on CUDA"
