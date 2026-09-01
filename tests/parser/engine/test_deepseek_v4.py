@@ -198,8 +198,13 @@ class TestThinkTagAbsorption:
 
 
 class TestMissingInvokeEnd:
-    def test_non_streaming(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+    @pytest.fixture
+    def weather_tool(self):
+        return _make_tool("get_weather", {"location": {"type": "string"}})
+
+    def test_non_streaming(self, mock_tokenizer, mock_request, weather_tool):
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[weather_tool])
+        mock_request.tools = [weather_tool]
         text = (
             f"{DSML_TOOL_START}"
             f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
@@ -214,8 +219,11 @@ class TestMissingInvokeEnd:
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args == {"location": "NYC"}
 
-    def test_streaming_with_trailing_content(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+    def test_streaming_with_trailing_content(
+        self, mock_tokenizer, mock_request, weather_tool
+    ):
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[weather_tool])
+        mock_request.tools = [weather_tool]
         chunks = [
             DSML_TOOL_START,
             f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
@@ -402,11 +410,12 @@ class TestMissingToolStart:
         assert result.content == text
 
     def test_unclosed_foreign_wrapper_then_native_call(
-        self, mock_tokenizer, mock_request
+        self, mock_tokenizer, mock_request, weather_tool
     ):
         """A foreign wrapper that never closes must not disable native
         tool parsing: the token backed tool_calls wrapper still wins."""
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[weather_tool])
+        mock_request.tools = [weather_tool]
         text = (
             DSML_FOREIGN_TOOL_START
             + "\nStray foreign text.\n"
@@ -1092,25 +1101,40 @@ class TestImplicitReasoningEnd:
     """
 
     @pytest.fixture
-    def thinking_parser(self, mock_tokenizer):
-        return DeepSeekV4Parser(mock_tokenizer, chat_template_kwargs={"thinking": True})
+    def declared_tools(self):
+        return [
+            _make_tool("get_weather", {"location": {"type": "string"}}),
+            _make_tool("get_time", {"timezone": {"type": "string"}}),
+        ]
+
+    @pytest.fixture
+    def thinking_parser(self, mock_tokenizer, declared_tools):
+        return DeepSeekV4Parser(
+            mock_tokenizer,
+            tools=declared_tools,
+            chat_template_kwargs={"thinking": True},
+        )
 
     def _reasoning_then_tool(self, reasoning_text: str) -> str:
         return reasoning_text + _tool_calls(
             _invoke("get_weather", ("location", "true", "NYC")),
         )
 
-    def test_non_streaming_extract_reasoning_implicit_end(self, thinking_parser):
+    def test_non_streaming_extract_reasoning_implicit_end(
+        self, thinking_parser, mock_request, declared_tools
+    ):
+        mock_request.tools = declared_tools
         text = self._reasoning_then_tool("Let me look up the weather.\n\n")
-        reasoning, content = thinking_parser.extract_reasoning(text, None)
+        reasoning, content = thinking_parser.extract_reasoning(text, mock_request)
         assert reasoning == "Let me look up the weather."
         assert DSML_TOOL_START not in reasoning
         assert DSML_INVOKE_PREFIX not in reasoning
         assert content is None
 
     def test_non_streaming_extract_tool_calls_implicit_end(
-        self, thinking_parser, mock_request
+        self, thinking_parser, mock_request, declared_tools
     ):
+        mock_request.tools = declared_tools
         text = self._reasoning_then_tool("Let me look up the weather.\n\n")
         result = thinking_parser.extract_tool_calls(text, mock_request)
         assert result.tools_called is True
@@ -1119,7 +1143,10 @@ class TestImplicitReasoningEnd:
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args == {"location": "NYC"}
 
-    def test_non_streaming_parse_implicit_end(self, thinking_parser, mock_request):
+    def test_non_streaming_parse_implicit_end(
+        self, thinking_parser, mock_request, declared_tools
+    ):
+        mock_request.tools = declared_tools
         text = self._reasoning_then_tool("Let me look up the weather.\n\n")
         reasoning, content, tool_calls = thinking_parser.parse(text, mock_request)
         assert reasoning == "Let me look up the weather."
@@ -1142,8 +1169,9 @@ class TestImplicitReasoningEnd:
         assert DSML_INVOKE_PREFIX not in reasoning
 
     def test_streaming_tool_extraction_implicit_end(
-        self, thinking_parser, mock_request
+        self, thinking_parser, mock_request, declared_tools
     ):
+        mock_request.tools = declared_tools
         chunks = [
             "Let me check.\n\n",
             DSML_TOOL_START,
@@ -1175,8 +1203,9 @@ class TestImplicitReasoningEnd:
         assert DSML_THINK_START not in reasoning
 
     def test_non_streaming_parallel_tools_after_implicit_end(
-        self, thinking_parser, mock_request
+        self, thinking_parser, mock_request, declared_tools
     ):
+        mock_request.tools = declared_tools
         text = "I need both.\n\n" + _tool_calls(
             _invoke("get_weather", ("location", "true", "NYC")),
             _invoke("get_time", ("timezone", "true", "EST")),

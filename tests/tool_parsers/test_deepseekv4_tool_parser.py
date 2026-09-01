@@ -81,6 +81,16 @@ def make_request(tools=None) -> MagicMock:
     return req
 
 
+def _mk_tool(name: str, properties: dict) -> ChatCompletionToolsParam:
+    """Tool declaration for parsers running under the declared-names gate."""
+    return ChatCompletionToolsParam(
+        function=FunctionDefinition(
+            name=name,
+            parameters={"type": "object", "properties": properties},
+        ),
+    )
+
+
 def build_tool_call(func_name: str, params: dict[str, str]) -> str:
     param_strs = "".join(
         f'{PARAM_START}{k}" string="true">{v}{PARAM_END}\n' for k, v in params.items()
@@ -88,7 +98,7 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
     return f'{TC_START}\n{INV_START}{func_name}">\n{param_strs}{INV_END}\n{TC_END}'
 
 
-def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int = 7):
+def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int = 7, tools=None):
     deltas = []
     previous_text = ""
     for start in range(0, len(full_text), chunk_size):
@@ -101,7 +111,7 @@ def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int =
             previous_token_ids=[],
             current_token_ids=[],
             delta_token_ids=[1],
-            request=make_request(),
+            request=make_request(tools),
         )
         previous_text = current_text
         if delta is not None:
@@ -130,12 +140,18 @@ def test_registered():
 
 
 def test_extract_tool_calls():
-    parser = make_parser()
+    tools = [
+        _mk_tool(
+            "get_weather",
+            {"location": {"type": "string"}, "unit": {"type": "string"}},
+        )
+    ]
+    parser = make_parser(tools=tools)
     model_output = "Let me check. " + build_tool_call(
         "get_weather", {"location": "Beijing", "unit": "celsius"}
     )
 
-    result = parser.extract_tool_calls(model_output, make_request())
+    result = parser.extract_tool_calls(model_output, make_request(tools))
 
     assert result.tools_called
     assert result.content == "Let me check. "
@@ -161,10 +177,11 @@ def test_function_calls_block_is_not_accepted():
 
 
 def test_streaming_extracts_complete_invokes():
-    parser = make_parser()
+    tools = [_mk_tool("search", {"query": {"type": "string"}})]
+    parser = make_parser(tools=tools)
     full_text = build_tool_call("search", {"query": "deepseek v4"})
 
-    deltas = stream(parser, full_text, chunk_size=5)
+    deltas = stream(parser, full_text, chunk_size=5, tools=tools)
 
     names = [
         tool_call.function.name
@@ -205,7 +222,7 @@ def test_streaming_emits_incremental_argument_chunks():
         f"{TC_END}"
     )
 
-    deltas = stream(parser, full_text, chunk_size=4)
+    deltas = stream(parser, full_text, chunk_size=4, tools=[tool])
     arg_chunks = [
         tool_call.function.arguments
         for delta in deltas
@@ -335,14 +352,23 @@ def test_no_dsml_closing_tag_leak_in_streamed_args(tools):
     emit the closing delimiter text as part of the content token.  The
     partial regex then captures it as part of the value, violating the
     prefix invariant and corrupting the streamed JSON.
+
+    Under the declared-names gate a request without tools can never emit
+    a tool call, so the no-tools variant asserts nothing is extracted.
     """
     full_text = build_tool_call("run_command", {"command": "git --version 2>&1"})
     expected = {"command": "git --version 2>&1"}
 
     for chunk_size in range(1, len(full_text) + 1):
         parser = make_parser(tools=tools)
-        deltas = stream(parser, full_text, chunk_size=chunk_size)
+        deltas = stream(parser, full_text, chunk_size=chunk_size, tools=tools)
         args_str = reconstruct_args(deltas)
+        if tools is None:
+            assert not args_str, (
+                f"Tool args emitted for a tool-less request at "
+                f"chunk_size={chunk_size}: {args_str!r}"
+            )
+            continue
         assert args_str, f"No args emitted at chunk_size={chunk_size}"
         assert "DSML" not in args_str, (
             f"DSML marker leaked into args at chunk_size={chunk_size}: {args_str!r}"
@@ -356,9 +382,10 @@ def test_no_dsml_closing_tag_leak_in_streamed_args(tools):
 
 def test_non_streaming_extract_with_angle_brackets():
     """Non-streaming extraction must correctly handle '>' in values."""
-    parser = make_parser()
+    tools = [_mk_tool("run_command", {"command": {"type": "string"}})]
+    parser = make_parser(tools=tools)
     full_text = build_tool_call("run_command", {"command": "git --version 2>&1"})
-    result = parser.extract_tool_calls(full_text, make_request())
+    result = parser.extract_tool_calls(full_text, make_request(tools))
 
     assert result.tools_called
     assert len(result.tool_calls) == 1
