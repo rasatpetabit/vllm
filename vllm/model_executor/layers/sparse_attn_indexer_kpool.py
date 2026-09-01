@@ -22,7 +22,7 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import has_deep_gemm, is_deep_gemm_supported
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -293,6 +293,12 @@ def sparse_attn_indexer_kpool(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
+    # no DeepGEMM on SM80/SM120/SM121; the Triton MQA-logits fallback below
+    # serves those arches (mirrors the dsv4 indexer fallback).
+    use_deep_gemm = is_deep_gemm_supported()
+    if not use_deep_gemm:
+        assert not use_fp4_cache, "Triton fallback does not support FP4 KV cache"
+
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
@@ -535,11 +541,28 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
-            else:
+            elif use_deep_gemm:
                 from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                # Triton fallback (no DeepGEMM on this arch; SM80/SM121).
+                from vllm.v1.attention.ops.mqa_logits_triton import (
+                    fp8_mqa_logits_triton,
+                )
+
+                assert q_scale_slice is None, (
+                    "Triton fallback does not support FP4 Q"
+                )
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
@@ -798,7 +821,7 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
             )
-        else:
+        elif use_deep_gemm:
             from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
             logits = fp8_fp4_paged_mqa_logits(
@@ -808,6 +831,24 @@ def sparse_attn_indexer_kpool(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
+        else:
+            # Triton fallback (no DeepGEMM on this arch; SM80/SM121).
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            assert padded_q_scale is None, (
+                "Triton fallback does not support FP4 Q"
+            )
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
@@ -974,9 +1015,11 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not has_deep_gemm() and use_fp4_cache:
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM for the "
+                "FP4 cache path; the FP8 path uses the Triton fallback on "
+                "arches without DeepGEMM (SM80/SM120/SM121)."
             )
 
     def forward_native(
