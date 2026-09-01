@@ -252,13 +252,13 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + S_OFFSET_NBYTES_IN_PAGE // 4
             + loc_token_offset_in_page
         )
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        tl.store(buf_fp8_ptr + out_k_offsets, _encode_e4m3fn_u8(quantized), mask=mask)
         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
 
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
-            quantized,
+            _encode_e4m3fn_u8(quantized),
             mask=offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
@@ -343,14 +343,14 @@ def kpool_compress_and_write_cache(
         compressed_scale = buf_fp32
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
-        buf_fp8,
+        buf_fp8.view(torch.uint8),
         buf_fp32,
         slot_k,
         slot_score,
         ape,
         loc,
         write_mask,
-        compressed_k,
+        compressed_k.view(torch.uint8),
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -598,7 +598,7 @@ def _kpool_decode_update_batched_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(buf_fp8_ptr + out_k_offsets, _encode_e4m3fn_u8(quantized), mask=dim_mask)
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
         # Stash the current token AFTER any completion read so the completion
@@ -683,7 +683,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     positions = positions.contiguous()
 
     _kpool_decode_update_batched_kernel[(num_requests,)](
-        buf_fp8,
+        buf_fp8.view(torch.uint8),
         buf_fp32,
         tail_kv_cache,
         tail_slot_mapping,
