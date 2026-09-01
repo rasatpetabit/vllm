@@ -866,7 +866,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
-            compress_ratio=self.compress_ratio,
+            # Compressed MLA page: one stored state per compress_ratio tokens.
+            tokens_per_state=self.compress_ratio,
+            # fp8_ds_mla DeepseekV4 storage: 448B NoPE + 128B RoPE + 8B scale.
+            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
             cache_dtype_str=self.kv_cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
@@ -904,7 +907,10 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            # Compressed MLA page: one stored state per compress_ratio tokens;
+            # head_dim already carries any fp8 scale padding, so the generic
+            # state content sizing applies.
+            tokens_per_state=self.compress_ratio,
             # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
             alignment=576 if uses_fp8_ds_mla_layout else 512,
         )
