@@ -852,6 +852,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]: the fused compress/store and sparse
+        # kernels address the cache as [num_blocks, stored_states, width]
+        # (dim 1 feeds kv_cache_block_size in the launchers). Matches the
+        # HEAD-native squeeze used by DeepseekCompressor/indexer caches.
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         if (
             self.compress_ratio <= 1
