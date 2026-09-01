@@ -942,7 +942,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if mqa_q_pe.shape[-1] == 0:
+                # NoPE-only MLA (e.g. glm5next on sm80): there is no rope
+                # part to concat, and concat_mla_q requires rope_dim 64.
+                mqa_q = mqa_ql_nope
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
