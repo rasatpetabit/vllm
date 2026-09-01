@@ -282,6 +282,10 @@ class AttentionBackend(ABC):
         use_dcp: bool = False,
     ) -> list[str]:
         invalid_reasons = []
+        if not cls.supports_compute_capability(device_capability):
+            invalid_reasons.append(
+                f"compute capability {device_capability} not supported"
+            )
         if not cls.supports_head_size(head_size):
             invalid_reasons.append("head_size not supported")
         if not cls.supports_dtype(dtype):
