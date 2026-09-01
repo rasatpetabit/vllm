@@ -692,9 +692,7 @@ def mhc_post_int8_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 
 def mhc_post_tilelang(
     a,
@@ -1033,9 +1031,7 @@ def hc_head_fuse_tilelang(
 # ---------------------------------------------------------------------------
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_fused_block_m_tilelang(
     comb_mix,
     residual_in,
@@ -1189,9 +1185,7 @@ def mhc_fused_block_m_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_pre_big_fuse_with_norm_reg_tilelang(
     gemm_out_mul,
     gemm_out_sqrsum,
@@ -1391,9 +1385,7 @@ def mhc_pre_big_fuse_with_norm_reg_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_post_sqrsum_int8_tilelang(
     a,
     b,
@@ -1476,9 +1468,7 @@ def mhc_post_sqrsum_int8_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_post_sqrsum_tilelang(
     a,
     b,
