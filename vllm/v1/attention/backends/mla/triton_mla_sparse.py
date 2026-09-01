@@ -94,6 +94,7 @@ class TritonMLASparseImpl(FlashMLASparseImpl):
         kv_c_and_k_pe_cache,  # [num_blocks, block_size, dim_qk]
         topk_indices,  # [num_mqa_tokens, topk] GLOBAL slots, compacted, -1 tail
         topk_length=None,  # per-token valid count (unused: -1 tail already bounds)
+        actual_num_heads: int | None = None,  # HEAD-parent signature (DCP-gathered heads)
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # The inherited FlashMLASparseImpl._forward_bf16_kv already globalized
         # the per-request indices with return_valid_counts=True, so valid slots
@@ -117,7 +118,9 @@ class TritonMLASparseImpl(FlashMLASparseImpl):
         # __init__ already rejects for the bf16 sparse path (NotImplementedError
         # unless the kv-cache is fp8_ds_mla). This Triton path is bf16-only, so
         # DCP never reaches here and returning None for the LSE is safe.
-        return output[:, : self.num_heads, :], None
+        if actual_num_heads is None:
+            actual_num_heads = self.num_heads
+        return output[:, :actual_num_heads, :], None
 
 
 class TritonMLASparseBackend(FlashMLASparseBackend):
