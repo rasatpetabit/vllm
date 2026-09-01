@@ -120,6 +120,12 @@ class TritonMLASparseImpl(FlashMLASparseImpl):
         # DCP never reaches here and returning None for the LSE is safe.
         if actual_num_heads is None:
             actual_num_heads = self.num_heads
+        # Fail loudly instead of silently clamping if the kernel contract
+        # ever changes (adversarial review slice-6 residual).
+        assert output.shape[1] >= actual_num_heads, (
+            f"triton_mla_sparse_attention returned {output.shape[1]} heads, "
+            f"expected at least {actual_num_heads}"
+        )
         return output[:, :actual_num_heads, :], None
 
 
