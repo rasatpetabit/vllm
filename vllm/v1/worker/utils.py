@@ -28,6 +28,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
