@@ -898,19 +898,23 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C] (HEAD-native view contract; the indexer
+        # kernels expect [num_blocks, block_size, width]).
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # head_dim already carries the fp8 scale padding
-        # compress_ratio=1 for V3.2, >1 for DeepseekV4; both use the same cache layout.
+        # head_dim already carries the fp8 scale padding.
+        # The indexer K cache stores one vector for EVERY token (logits scoring
+        # spans the full context), so no tokens_per_state compression here --
+        # 01ecc8e4's compress_ratio kwarg only fed its storage_block_size
+        # property, which the HEAD view system does not use.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            # Compressed MLA page: one stored state per compress_ratio tokens;
-            # head_dim already carries any fp8 scale padding, so the generic
-            # state content sizing applies.
-            tokens_per_state=self.compress_ratio,
             # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
             alignment=576 if uses_fp8_ds_mla_layout else 512,
         )
