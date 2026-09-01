@@ -570,7 +570,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         _apply_alignment_padding(self)
 
     @property
-    def real_page_size_bytes(self) -> int:
+    def unpadded_page_size_bytes(self) -> int:
         # fp8_ds_mla layouts carry per-token bytes the generic head_size calc
         # cannot express (restored from 01ecc8e4). Non-fp8_ds_mla specs keep
         # the generic post-refactor sizing.
@@ -582,7 +582,13 @@ class MLAAttentionSpec(FullAttentionSpec):
             # V3.2 main MLA: 656-byte layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
-        return super().real_page_size_bytes
+        return super().unpadded_page_size_bytes
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        # _apply_alignment_padding reads this; keep it consistent with the
+        # layout-aware unpadded size above.
+        return self.unpadded_page_size_bytes
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
