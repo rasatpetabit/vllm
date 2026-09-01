@@ -25,7 +25,11 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockCopy,
+    KVCacheConfig,
+    KVCacheLayout,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -672,3 +676,110 @@ def is_residual_scattered_for_sp(
     assert num_input_tokens % tp == 0
 
     return True
+
+
+# --- grafted from pr/53906 base (incident 2026-08-31 T14: step-4 application
+# --- of 01ecc8e4 rewrote this file against an older mainline and dropped these
+# --- symbols that the newer mainline-derived callers in this branch require).
+
+@dataclass
+class EncoderTimingStats:
+    """Per-request timing statistics for encoder forward pass."""
+
+    encoder_forward_secs: float = 0.0
+    """Time spent in vision encoder forward pass (seconds)."""
+
+    num_encoder_calls: int = 0
+    """Number of times encoder was called for this request."""
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "encoder_forward_secs": self.encoder_forward_secs,
+            "num_encoder_calls": self.num_encoder_calls,
+        }
+def allocate_kv_cache(
+    kv_cache_config: KVCacheConfig,
+    device: torch.device,
+    layout: KVCacheLayout,
+    kernel_block_sizes: list[int] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
+
+    Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
+    block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
+    groups overlay each other, so tensors may address the same bytes.
+    """
+    if not kv_cache_config.kv_cache_tensors:
+        return {}
+
+    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+    raw_size = sizes.pop()
+    page_size = 4096
+    buf = torch.zeros(
+        ((raw_size + page_size - 1) // page_size) * page_size,
+        dtype=torch.int8,
+        device=device,
+    )
+
+    kv_caches: dict[str, torch.Tensor] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        layer_name = tensor.layers[0]
+        group_id, group = next(
+            (group_id, group)
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if layer_name in group.layer_names
+        )
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.kv_cache_specs[layer_name]
+
+        num_blocks = kv_cache_config.num_blocks
+        kernel_block_size = None
+        if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
+            kernel_block_size = kernel_block_sizes[group_id]
+        if isinstance(spec, MLAAttentionSpec) and spec.storage_block_size is not None:
+            kernel_block_size = spec.storage_block_size
+
+        views = create_kv_cache_views(
+            buf,
+            spec,
+            num_blocks,
+            layout,
+            tensor,
+            kernel_block_size=kernel_block_size,
+        )
+        kv_caches.update(zip(tensor.layers, views))
+    return kv_caches
+
+
+def get_uniform_decode_token_count(
+    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
+) -> int | None:
+    """Per-request token count of a uniform decode batch, or None."""
+    if not has_prefill and is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+        return max_query_len
+    return None
+
+
+def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
+    """Whether every request in the batch has the same query length.
+
+    Shape test only; use ``get_uniform_decode_token_count`` to classify a
+    scheduled batch, since a prompt chunk can have a decode batch's shape.
+    """
+    return num_reqs > 0 and num_tokens == max_query_len * num_reqs
+
+
+def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
+    if not any(num_nans_in_logits.values()):
+        return
+
+    corrupted_requests = {
+        req_id: num_nans
+        for req_id, num_nans in num_nans_in_logits.items()
+        if num_nans > 0
+    }
+    raise RuntimeError(f"NaNs detected in logits: {corrupted_requests}")
+
+
