@@ -549,6 +549,7 @@ class MLAAttentionSpec(FullAttentionSpec):
     cache_dtype_str: str | None = None
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
+    compress_ratio: int = 1  # Default to 1 for no compression (01ecc8e4 contract).
     model_version: str | None = None
     storage_block_size: int | None = None
     """Token width used to view storage when it differs from the kernel block."""
@@ -559,7 +560,29 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        # 01ecc8e4 callers pass compress_ratio but not storage_block_size; the
+        # post-refactor tree treats storage_block_size as the storage token
+        # width. Derive it so both contracts agree.
+        if self.storage_block_size is None and self.compress_ratio > 1:
+            object.__setattr__(
+                self, "storage_block_size", self.block_size // self.compress_ratio
+            )
         _apply_alignment_padding(self)
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        # fp8_ds_mla layouts carry per-token bytes the generic head_size calc
+        # cannot express (restored from 01ecc8e4). Non-fp8_ds_mla specs keep
+        # the generic post-refactor sizing.
+        if self.cache_dtype_str == "fp8_ds_mla":
+            if self.model_version == "deepseek_v4":
+                # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B/token.
+                sbs = self.storage_block_size or self.block_size
+                return sbs * 584
+            # V3.2 main MLA: 656-byte layout (kv_lora_rank=512 +
+            # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
+            return self.block_size * 656
+        return super().real_page_size_bytes
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -569,16 +592,18 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
         storage_block_size_set = set(spec.storage_block_size for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
+            and len(compress_ratio_set) == 1
             and len(storage_block_size_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, tokens per state, model version, and storage "
-            "block size."
+            "quantization method, tokens per state, model version, compression "
+            "ratio, and storage block size."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -592,6 +617,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
             storage_block_size=storage_block_size_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
