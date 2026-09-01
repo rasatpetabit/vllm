@@ -54,49 +54,61 @@ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
     raise RuntimeError(f"NaNs detected in logits: {corrupted_requests}")
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
-    seg_block_strides_ptr,
-    seg_page_sizes_ptr,
+    seg_period_ptr,
+    chunk_seg_ptr,
+    chunk_base_ptr,
+    chunk_len_ptr,
     block_ids_ptr,
+    n_blocks,
+    N_CHUNKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Zero KV cache blocks across all segments in a single launch.
+    """Zero KV cache blocks across one group's segments in a single launch.
 
-    Each segment is a contiguous region of one block's data.  Layer-compact
-    layouts have one segment per layer buffer; dimensions physically outside
-    the block dim (separate head groups under LHBNC) and virtual block splits
-    each get their own segment.
-
-    Segments may have different block strides and page sizes (e.g. packed
-    KV views or models with multiple KV cache groups like MLA + DSA
-    indexer). Each segment's block stride determines where a logical block
-    begins, while its page size determines how many elements are cleared.
+    Each segment is one layer view's block-indexed region.  For backends
+    where blocks are outermost (block_dim=0) there is one segment per
+    buffer.  For backends where K/V is outermost (block_dim=1) there are
+    two segments per buffer (one for K, one for V).
 
     seg_addrs_ptr holds absolute byte addresses (int64) for each segment,
     allowing segments to live in different CUDA allocations.
 
-    Programs are mapped directly onto a 3-D grid as
-    (block_index, seg_index, chunk_index).
+    Addressing uses the tensor's block STRIDE (``seg_period_ptr`` is one
+    logical block's span: virtual-split ratio x kernel-block stride); the
+    zeroed extent is the block's LOGICAL bytes only. With interleaved
+    multi-layer pool views (stride >> logical size), conflating the two
+    zeroed whole pool stripes and wiped live neighboring blocks (#50576).
+    ``chunk_base_ptr``/``chunk_len_ptr`` are precomputed on the host so a
+    chunk never crosses a sub-block boundary.
+
+    Programs are mapped as ``(block_index, chunk_id)`` against a flattened
+    chunk list, so every program has work (see ``build_meta`` for why the
+    list is flattened rather than a rectangular grid). The tail is masked,
+    so BLOCK_SIZE need not divide the block extent at all.
     """
-    block_index = tl.program_id(0)
-    seg_index = tl.program_id(1)
-    chunk_index = tl.program_id(2)
-    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
-    page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
-    chunk_offset = chunk_index.to(tl.int64) * BLOCK_SIZE
-    if chunk_offset >= page_size_el:
+    pid = tl.program_id(0)
+    block_index = pid // N_CHUNKS
+    if block_index >= n_blocks:
         return
+    chunk_id = pid % N_CHUNKS
+    seg_index = tl.load(chunk_seg_ptr + chunk_id)
+    chunk_base = tl.load(chunk_base_ptr + chunk_id)
+    chunk_len = tl.load(chunk_len_ptr + chunk_id)
+
+    period_el = tl.load(seg_period_ptr + seg_index)
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
-    block_offset = block_id.to(tl.int64) * block_stride_el.to(tl.int64)
-    cols = chunk_offset + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+
+    offset = block_id.to(tl.int64) * period_el.to(tl.int64) + chunk_base.to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     tl.store(
-        ptr + block_offset + cols,
+        ptr + offset + cols,
         tl.zeros([BLOCK_SIZE], dtype=tl.int32),
-        mask=cols < page_size_el,
+        mask=cols < chunk_len.to(tl.int64),
     )
 
 
@@ -114,50 +126,48 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
-        num_blocks: int,
+        num_blocks: int | None = None,  # accepted for HEAD caller compat; unused
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
-        """Precompute the absolute-address table for the Triton zeroing kernel.
+        """Precompute the absolute-address tables for the Triton zeroing kernel.
 
-        Each entry is the absolute byte address of a segment start on the
-        GPU, so segments in different CUDA allocations work correctly.
-
-        Per-layer views are standardized ``[B, H, N, C]`` with blocks at dim 0; dims
-        physically outside B (separate head groups under LHBNC) each get their own
-        segment. A segment's page spans everything inside its block, so under BHLNC it
-        also covers the block's other layers -- safe, since block IDs are global pool
-        indices and a newly allocated block owns its whole tile.
-
-        Block IDs from the scheduler reference logical blocks whose size
-        may differ from the kernel block size (virtual block splitting).
-        Each virtual block is represented as an independent segment so its
-        physical block stride and zeroed page span remain independent.
+        Metadata is held PER KV-CACHE GROUP: block ids are group-scoped
+        (virtual block splitting maps the same id to different pages in
+        groups with different block geometries), so applying one group's ids
+        to another group's segments would wipe live pages there -- the
+        nondeterministic long-context corruption of #50576.
 
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
-        self._meta: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
-        ) = None
+        self._group_meta: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                  torch.Tensor, int],
+        ] = {}
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
-        # Overlaid layers (packed layouts) share a base address but may have
-        # different page sizes; keep the widest span per address so newly
-        # allocated blocks are fully zeroed for every overlaying group.
-        seen_ptrs: dict[int, int] = {}
-        seg_addrs: list[int] = []
-        seg_block_strides: list[int] = []
-        seg_page_sizes: list[int] = []
+        seen_ptrs: set[int] = set()
+        group_segs: dict[int, tuple[list[int], list[int], list[int], list[int]]] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, AttentionSpec):
+            if not isinstance(spec, FullAttentionSpec):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
-            assert spec.block_size % kernel_bs == 0
+            ratio = spec.block_size // kernel_bs
+            block_dim = group.backend.get_kv_cache_block_dim(
+                kernel_bs,
+                spec.num_kv_heads,
+                spec.head_size,
+                cache_dtype_str=getattr(spec, "cache_dtype_str", None),
+            )
+            segs = group_segs.setdefault(group.kv_cache_group_id, ([], [], [], []))
+            seg_addrs, seg_strides, seg_extents, seg_ratios = segs
+
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
@@ -165,90 +175,136 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
-
-                assert kv.shape[0] % num_blocks == 0, (
-                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
-                )
-                ratio = kv.shape[0] // num_blocks
+                if dp in seen_ptrs:
+                    continue
+                seen_ptrs.add(dp)
 
                 el = kv.element_size()
-                block_stride_bytes = kv.stride(0) * el
-                assert block_stride_bytes % 4 == 0
-                assert kv.shape[0] % ratio == 0
+                # Addressing step between consecutive kernel blocks (bytes).
+                stride_bytes = kv.stride(block_dim) * el
+                # Logical bytes of one kernel block's data in this view: the
+                # product of the dims inside the block, which must be densely
+                # packed for a single contiguous store range. NOT the block
+                # stride: for interleaved multi-layer pool views the stride
+                # spans every layer, and zeroing that span wipes live
+                # neighboring blocks (#50576).
+                inner_el = 1
+                for d in range(block_dim + 1, kv.dim()):
+                    inner_el *= kv.shape[d]
+                extent_bytes = inner_el * el
+                expected = 1
+                for d in range(kv.dim() - 1, block_dim, -1):
+                    assert kv.stride(d) == expected, (
+                        f"{layer_name}: non-contiguous block interior "
+                        f"(dim {d} stride {kv.stride(d)} != {expected})"
+                    )
+                    expected *= kv.shape[d]
+                assert stride_bytes % 4 == 0 and extent_bytes % 4 == 0
+
                 outer_dims = [
-                    d
-                    for d in range(1, kv.ndim)
-                    if kv.stride(d) * el > block_stride_bytes
+                    d for d in range(block_dim) if kv.stride(d) * el > stride_bytes
                 ]
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
-                inner_dims = [d for d in range(1, kv.ndim) if d not in outer_dims]
-                kernel_page_bytes = el + sum(
-                    (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
-                )
-                assert kernel_page_bytes % 4 == 0
-                logical_block_stride_bytes = block_stride_bytes * ratio
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    assert (dp + off_bytes) % 4 == 0
-                    for virtual_index in range(ratio):
-                        addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
-                            assert (
-                                seg_block_strides[idx]
-                                == logical_block_stride_bytes // 4
-                            )
-                            seg_page_sizes[idx] = max(
-                                seg_page_sizes[idx], kernel_page_bytes // 4
-                            )
-                            continue
-                        seen_ptrs[addr] = len(seg_addrs)
-                        seg_addrs.append(addr)
-                        seg_block_strides.append(logical_block_stride_bytes // 4)
-                        seg_page_sizes.append(kernel_page_bytes // 4)
+                    seg_addrs.append(dp + off_bytes)
+                    seg_strides.append(stride_bytes // 4)
+                    seg_extents.append(extent_bytes // 4)
+                    seg_ratios.append(ratio)
 
+        for group_id, (seg_addrs, seg_strides, seg_extents, seg_ratios) in (
+            group_segs.items()
+        ):
+            meta = self.build_meta(
+                seg_addrs, seg_strides, seg_extents, seg_ratios, self.device
+            )
+            if meta is not None:
+                self._group_meta[group_id] = meta
+
+    # 4 KB of int32 per program. Wide enough that the store dominates the
+    # index arithmetic; small enough that a short page still spreads over
+    # several programs.
+    CHUNK_ELEMS = 1024
+
+    @classmethod
+    def build_meta(
+        cls,
+        seg_addrs: list[int],
+        seg_strides: list[int],
+        seg_extents: list[int],
+        seg_ratios: list[int],
+        device: torch.device,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+              torch.Tensor, int]
+        | None
+    ):
+        """Flatten (segment, sub-block, chunk) triples so no launched program
+        exits empty and no chunk crosses a sub-block boundary.
+
+        Block extents are heterogeneous -- DeepSeek-V4 alone mixes a
+        9344-element MLA page, a 2112-element indexer page and an
+        8192-element compressor page -- and the flattened list lets each
+        segment contribute exactly ``ratio * cdiv(extent, CHUNK_ELEMS)``
+        chunks instead of the largest segment's count. Each chunk stores its
+        element offset within one logical block's address span
+        (``sub_block * stride + within``) and its valid length, so the
+        kernel only ever adds ``block_id * (ratio * stride)``.
+        """
         if not seg_addrs:
-            self._meta = None
-            return
+            return None
 
-        max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
-            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
-            (max_page_size_el + blk_size - 1) // blk_size,
-            blk_size,
-            len(seg_addrs),
+        chunk_seg: list[int] = []
+        chunk_base: list[int] = []
+        chunk_len: list[int] = []
+        for seg_index, (stride_el, extent_el, ratio) in enumerate(
+            zip(seg_strides, seg_extents, seg_ratios)
+        ):
+            for sub_block in range(ratio):
+                for chunk in range(cdiv(extent_el, cls.CHUNK_ELEMS)):
+                    within = chunk * cls.CHUNK_ELEMS
+                    chunk_seg.append(seg_index)
+                    chunk_base.append(sub_block * stride_el + within)
+                    chunk_len.append(min(cls.CHUNK_ELEMS, extent_el - within))
+
+        seg_periods = [s * r for s, r in zip(seg_strides, seg_ratios)]
+        return (
+            torch.tensor(seg_addrs, dtype=torch.uint64, device=device),
+            torch.tensor(seg_periods, dtype=torch.int64, device=device),
+            torch.tensor(chunk_seg, dtype=torch.int32, device=device),
+            torch.tensor(chunk_base, dtype=torch.int64, device=device),
+            torch.tensor(chunk_len, dtype=torch.int32, device=device),
+            len(chunk_seg),
         )
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+    def zero_block_ids(self, block_ids_per_group: list[list[int]]) -> None:
+        """Zero the KV cache memory for the given per-group block IDs."""
+        if not block_ids_per_group or not self._group_meta:
             return
-        (
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            max_chunks,
-            blk_size,
-            n_segs,
-        ) = self._meta
-        n_blocks = len(block_ids)
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        grid = (n_blocks, n_segs, max_chunks)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            idx,
-            BLOCK_SIZE=blk_size,
-        )
+        for group_id, block_ids in enumerate(block_ids_per_group):
+            meta = self._group_meta.get(group_id)
+            if not block_ids or meta is None:
+                continue
+            seg_addrs, seg_periods, chunk_seg, chunk_base, chunk_len, n_chunks = meta
+            n_blocks = len(block_ids)
+            idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+            grid = (n_blocks * n_chunks,)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                seg_periods,
+                chunk_seg,
+                chunk_base,
+                chunk_len,
+                idx,
+                n_blocks,
+                N_CHUNKS=n_chunks,
+                BLOCK_SIZE=self.CHUNK_ELEMS,
+            )
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
         if num_kv_blocks > 0:
-            self.zero_block_ids([0])
+            self.zero_block_ids([[0]] * (max(self._group_meta, default=-1) + 1))
 
 
 @dataclass
