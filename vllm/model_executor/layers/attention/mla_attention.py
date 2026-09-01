@@ -385,6 +385,11 @@ def _get_kv_b_proj_input_dtype(
     return weight_dtype
 
 
+from vllm.v1.attention.backends.mla.mla_query_dispatch import (
+    select_decode_mqa_query,
+)
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -942,18 +947,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if mqa_q_pe.shape[-1] == 0:
-                # NoPE-only MLA (e.g. glm5next on sm80): there is no rope
-                # part to concat, and concat_mla_q requires rope_dim 64.
-                mqa_q = mqa_ql_nope
-            elif fp8_attention and self.impl.supports_quant_query_input:
-                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
-            else:
-                mqa_q = (mqa_ql_nope, mqa_q_pe)
+            mqa_q = select_decode_mqa_query(
+                mqa_ql_nope,
+                mqa_q_pe,
+                layer_name=self.layer_name,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                fp8_attention=fp8_attention,
+                supports_quant_query_input=self.impl.supports_quant_query_input,
+                concat_quant_fp8_op=self._decode_concat_quant_fp8_op,
+                q_scale=self._q_scale,
+            )
             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
