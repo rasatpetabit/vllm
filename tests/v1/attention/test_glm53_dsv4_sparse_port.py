@@ -605,8 +605,6 @@ def test_ampere_selection_real_sm80_sm90_cpu() -> None:
       - CUDA hosts:     ``test_ampere_dsv4_backend_instantiates_and_executes_decode``
         (needs_gpu) proves REAL on-device selection with no stub.
     """
-    from vllm.platforms.interface import DeviceCapability
-
     tl_before = _prove_parent_tl_untouched()
     res = _subprocess_select_ampere_attn()
 
