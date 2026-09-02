@@ -344,6 +344,12 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # ROCm aiter sparse MLA: rope-only geometry (DSV4 AMD path); no NoPE path is proven
+        return frozenset({QueryLayout.ROPE})
 
     @classmethod
     def is_sparse(cls) -> bool:

@@ -97,6 +97,12 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # FlashInfer SM90 sparse: proven by test_flashinfer_sm90_sparse_query_layout_contract — the geometry gate accepts qk_rope_head_dim in (0, 64) (kpe 0 needs flashinfer >= 0.6.18)
+        return frozenset({QueryLayout.NOPE_ONLY, QueryLayout.ROPE})
 
     @classmethod
     def is_sparse(cls) -> bool:

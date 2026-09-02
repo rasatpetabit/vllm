@@ -25,6 +25,13 @@ class DeepseekV4AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == 8
 
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # DSV4 Ampere sparse (576 = ckv 512 + kpe 64): rope-only; the DSV4 geometry always carries a rope part
+        return frozenset({QueryLayout.ROPE})
+
 
 class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
     """SM8x DeepSeek V4 attention: ROCm Triton path on CUDA Ampere."""

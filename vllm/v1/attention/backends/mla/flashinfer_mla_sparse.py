@@ -61,6 +61,12 @@ class _FlashInferMLASparseBackendBase(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # FlashInfer sparse (default arch path): rope-only; no NoPE path is proven
+        return frozenset({QueryLayout.ROPE})
 
     @classmethod
     def is_sparse(cls) -> bool:

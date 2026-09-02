@@ -511,6 +511,13 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
 
 
 class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4FlashMLABackend):
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # DSV4 ROCm aiter sparse: rope-only (DSV4 576 geometry)
+        return frozenset({QueryLayout.ROPE})
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_FLASHMLA_SPARSE_DSV4"

@@ -296,6 +296,14 @@ from vllm.v1.attention.ops.pcp import (
     maybe_gather_mla_latent_cache_inputs,
 )
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.attention.backends.mla.mla_query_dispatch import (
+    select_decode_mqa_query,
+)
+from vllm.v1.attention.backends.mla.query_layout import (
+    QueryLayout,
+    UnsupportedQueryLayout,
+    query_layout_for,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -385,9 +393,6 @@ def _get_kv_b_proj_input_dtype(
     return weight_dtype
 
 
-from vllm.v1.attention.backends.mla.mla_query_dispatch import (
-    select_decode_mqa_query,
-)
 
 
 class MLAAttention(nn.Module, AttentionLayerBase):
@@ -481,7 +486,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 use_mla=True,
                 use_sparse=use_sparse,
                 num_heads=self.num_heads,
+                qk_rope_head_dim=self.qk_rope_head_dim,
             )
+            # Construction-time layout invariant (defence in depth behind
+            # the selection-time contract): the selected backend must
+            # declare this layer's actual decode-query geometry.
+            _requested = query_layout_for(self.qk_rope_head_dim)
+            _declared = frozenset(self.attn_backend.supported_query_layouts())
+            if _requested not in _declared:
+                raise UnsupportedQueryLayout(
+                    f"{prefix}: backend {self.attn_backend.get_name()} does not "
+                    f"declare query layout {_requested} "
+                    f"(declared: {sorted(str(l) for l in _declared)})"
+                )
 
         normalized_kv_cache_dtype = _canonicalize_sparse_mla_kv_cache_dtype(
             self.attn_backend, kv_cache_dtype
@@ -1486,6 +1503,13 @@ class MLACommonBackend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+
+    @classmethod
+    def supported_query_layouts(cls) -> "frozenset[QueryLayout]":
+        # Dense MLA backends consume the standard nope+rope query geometry;
+        # no kernel-contract test proves a NoPE-only dense path, so the
+        # fail-closed declaration is rope-only (design rev 7 section 4.4).
+        return frozenset({QueryLayout.ROPE})
 
 
 @dataclass

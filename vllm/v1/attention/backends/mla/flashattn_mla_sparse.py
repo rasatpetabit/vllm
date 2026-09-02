@@ -62,6 +62,12 @@ class FlashAttnMLASparseBackend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # FlashAttention sparse MLA: rope-only geometry (kpe=64 contract); no NoPE path is proven
+        return frozenset({QueryLayout.ROPE})
 
     @classmethod
     def is_sparse(cls) -> bool:

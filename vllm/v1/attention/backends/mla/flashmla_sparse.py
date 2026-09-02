@@ -120,6 +120,12 @@ class FlashMLASparseBackend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # FlashMLA sparse: the q-concat requires a rope part (kpe=64); NoPE crashes in concat_mla_q — rope-only, fail closed
+        return frozenset({QueryLayout.ROPE})
 
     @classmethod
     def is_sparse(cls) -> bool:

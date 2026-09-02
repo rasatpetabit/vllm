@@ -162,6 +162,17 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supported_query_layouts(cls) -> "frozenset":
+        """Declared decode-query layouts. Non-MLA backends are never
+        consulted; the MLA surface lives on the query_layout module (a
+        missing MLA declaration raises there — fail closed)."""
+        from vllm.v1.attention.backends.mla.query_layout import (
+            supported_query_layouts as _mla_declaration,
+        )
+
+        return _mla_declaration()
+
+    @classmethod
     def supports_sink(cls) -> bool:
         return False
 
@@ -280,6 +291,7 @@ class AttentionBackend(ABC):
         use_pcp: bool = False,
         use_adaptive_verification: bool = False,
         use_dcp: bool = False,
+        qk_rope_head_dim: int = 0,
     ) -> list[str]:
         invalid_reasons = []
         if not cls.supports_compute_capability(device_capability):
@@ -310,6 +322,28 @@ class AttentionBackend(ABC):
                 invalid_reasons.append("sparse not supported")
             else:
                 invalid_reasons.append("non-sparse not supported")
+        if use_mla:
+            # Query-layout capability (design rev 7 section 4.4): the
+            # requested decode-query geometry must appear in the backend's
+            # declaration. A missing declaration RAISES (fail closed: an
+            # undeclared MLA backend refuses selection entirely); a layout
+            # mismatch is a structured rejection so it lands in the
+            # selection evidence record.
+            from vllm.v1.attention.backends.mla.query_layout import (
+                UnsupportedQueryLayout,
+                query_layout_for,
+            )
+
+            requested = query_layout_for(qk_rope_head_dim)
+            try:
+                declared = frozenset(cls.supported_query_layouts())
+            except UnsupportedQueryLayout:
+                raise
+            if requested not in declared:
+                invalid_reasons.append(
+                    f"query layout {requested.value} not supported "
+                    f"(declared: {sorted(str(l) for l in declared)})"
+                )
         if use_per_head_quant_scales and not cls.supports_per_head_quant_scales():
             invalid_reasons.append("per-head quant scales not supported")
         if not cls.supports_attn_type(attn_type):

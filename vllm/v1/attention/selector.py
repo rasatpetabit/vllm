@@ -36,6 +36,10 @@ class AttentionSelectorConfig(NamedTuple):
     use_pcp: bool = False
     use_adaptive_verification: bool = False
     use_dcp: bool = False
+    # MLA decode-query geometry (0 = NoPE-only; the layout contract lives in
+    # vllm.v1.attention.backends.mla.query_layout). Defaults to 0 for
+    # non-MLA callers (never consulted when use_mla is False).
+    qk_rope_head_dim: int = 0
 
     def __repr__(self):
         return (
@@ -111,6 +115,7 @@ def get_attn_backend(
     attn_type: str | None = None,
     num_heads: int | None = None,
     has_sliding_window: bool = False,
+    qk_rope_head_dim: int = 0,
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
 
@@ -168,6 +173,7 @@ def get_attn_backend(
         use_pcp=vllm_config.parallel_config.prefill_context_parallel_size > 1,
         use_adaptive_verification=use_adaptive_verification,
         use_dcp=vllm_config.parallel_config.decode_context_parallel_size > 1,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
 
     # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over

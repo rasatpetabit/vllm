@@ -62,6 +62,12 @@ class XPUMLASparseBackend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # XPU sparse MLA: rope-only geometry; no NoPE path is proven
+        return frozenset({QueryLayout.ROPE})
 
     @classmethod
     def is_sparse(cls) -> bool:

@@ -11,6 +11,8 @@ from collections.abc import Callable
 
 import torch
 
+from vllm.v1.attention.backends.mla.query_layout import UnsupportedQueryLayout
+
 
 def select_decode_mqa_query(
     mqa_ql_nope: torch.Tensor,
@@ -39,14 +41,23 @@ def select_decode_mqa_query(
                 f"{qk_rope_head_dim}; refusing NoPE-only decode path"
             )
         if fp8_attention:
-            raise NotImplementedError(
+            # Stable exception type (never a bare assert; python -O removes
+            # asserts and the contract would fail silently downstream).
+            raise UnsupportedQueryLayout(
                 f"{layer_name}: fp8_attention with NoPE-only MLA "
                 "is not implemented; the fused fp8 concat requires a rope part"
             )
         return mqa_ql_nope
     if fp8_attention and supports_quant_query_input:
-        assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-        assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-        assert concat_quant_fp8_op is not None
+        if concat_quant_fp8_op is None:
+            raise UnsupportedQueryLayout(
+                f"{layer_name}: fp8_attention with a quant-query kernel "
+                "requires concat_quant_fp8_op; got None"
+            )
+        if mqa_ql_nope.shape[0] != mqa_q_pe.shape[0] or mqa_ql_nope.shape[1] != mqa_q_pe.shape[1]:
+            raise UnsupportedQueryLayout(
+                f"{layer_name}: nope/pe batch-head mismatch "
+                f"{tuple(mqa_ql_nope.shape)} vs {tuple(mqa_q_pe.shape)}"
+            )
         return concat_quant_fp8_op(mqa_ql_nope, mqa_q_pe, q_scale)
     return (mqa_ql_nope, mqa_q_pe)

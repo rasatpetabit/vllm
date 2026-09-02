@@ -134,6 +134,13 @@ class TritonMLASparseBackend(FlashMLASparseBackend):
     # fp8 decode kernel (sm90/sm100), so drop it from the supported set here.
     supported_kv_cache_dtypes: list[CacheDType] = ["auto", "bfloat16"]
 
+    @classmethod
+    def supported_query_layouts(cls) -> frozenset:
+        from vllm.v1.attention.backends.mla.query_layout import QueryLayout
+
+        # Triton sparse: proven by test_triton_sparse_query_layout_contract — mla_query_dispatch handles rope_dim 0 (NoPE pass-through, f7ea90dea6) and 64 (concat)
+        return frozenset({QueryLayout.NOPE_ONLY, QueryLayout.ROPE})
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA_SPARSE"
