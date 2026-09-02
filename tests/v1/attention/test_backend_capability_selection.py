@@ -18,6 +18,9 @@ from vllm.platforms.interface import DeviceCapability
 try:
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+        DeepseekV4AmpereMLASparseBackend,
+    )
     from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
         FlashAttnMLASparseBackend,
     )
@@ -61,6 +64,11 @@ SM100 = DeviceCapability(10, 0)
         # Non-sparse sanity: FA needs sm80+.
         (FlashAttentionBackend, SM80, True),
         (FlashAttentionBackend, DeviceCapability(7, 0), False),
+        # DSV4 Ampere (TRITON_MLA_SPARSE_DSV4): the sm80 lane, exclusively —
+        # matrix completeness per design rev 7 4.4.
+        (DeepseekV4AmpereMLASparseBackend, SM80, True),
+        (DeepseekV4AmpereMLASparseBackend, SM90, False),
+        (DeepseekV4AmpereMLASparseBackend, SM100, False),
     ],
 )
 def test_capability_declaration(backend, capability, expected) -> None:
