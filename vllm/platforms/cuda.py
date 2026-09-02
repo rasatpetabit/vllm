@@ -79,6 +79,31 @@ def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int
     return r
 
 
+def _sort_sparse_tail_by_layout(
+    sparse_tail: list[AttentionBackendEnum], qk_rope_head_dim: int
+) -> list[AttentionBackendEnum]:
+    """Sort the sparse-MLA tail by the declaration-derived key (design rev 7
+    section 4.4). Declarations resolve lazily; an unimportable backend is
+    treated as undeclared (sorted last within its key group) — its
+    ImportError is recorded by get_valid_backends, never by ordering."""
+    from vllm.v1.attention.backends.mla.query_layout import (
+        query_layout_for,
+        sort_sparse_tail,
+    )
+
+    requested = query_layout_for(qk_rope_head_dim)
+    declared = {}
+    for backend in sparse_tail:
+        try:
+            declared[backend] = frozenset(
+                _get_attn_backend_class(backend).supported_query_layouts()
+            )
+        except Exception:  # noqa: BLE001 - unimportable == undeclared for ordering
+            pass
+    platform = {backend: index for index, backend in enumerate(sparse_tail)}
+    return sort_sparse_tail(sparse_tail, requested, declared, platform)
+
+
 @cache
 def _get_backend_priorities(
     use_mla: bool,
@@ -87,6 +112,7 @@ def _get_backend_priorities(
     kv_cache_dtype: CacheDType | None = None,
     use_non_causal: bool = False,
     head_size: int | None = None,
+    qk_rope_head_dim: int = 0,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -145,22 +171,26 @@ def _get_backend_priorities(
             # sparse reject sm80, so without it the sparse tail would be empty
             # on Ampere. Kept last so sm90/sm100 keep their preferred kernels.
             #
-            # head_size 512 (glm5next): the FlashInfer SM90 NoPE kernel is the
-            # preferred sparse path where available (sm90), so it is inserted
-            # FIRST; on sm80 it is cleanly rejected by compute capability and
-            # selection falls through to TRITON_MLA_SPARSE. head_size 576
-            # (DSV4): the SM90 entry is appended AFTER the reference DSV4 tail
-            # so the DSV4 sparse preference order is unchanged.
+            # Declaration-derived ordering (design rev 7 section 4.4): the
+            # former head-size-512 identity branch is replaced by a
+            # total, deterministic sort of the sparse tail keyed on
+            # (0 if supported_query_layouts() == {requested} else 1,
+            #  platform_priority_index, backend_name). The platform list
+            # below is the base (rope) preference; an exact layout
+            # specialist is promoted ahead of general-purpose backends, and
+            # ties resolve by platform index then name — no backend-specific
+            # branch remains. With the current declarations (Triton sparse
+            # and FlashInfer SM90 both serve NoPE and rope) nothing is an
+            # exact specialist, so rope-geometry selection is unchanged; a
+            # NoPE request on sm90 now orders by platform index instead of
+            # the removed FlashInfer-first special case.
             sparse_tail = [
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
                 AttentionBackendEnum.TRITON_MLA_SPARSE,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
             ]
-            flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
-            if head_size == 512:
-                sparse_tail.insert(0, flashinfer_sparse)
-            else:
-                sparse_tail.append(flashinfer_sparse)
+            sparse_tail = _sort_sparse_tail_by_layout(sparse_tail, qk_rope_head_dim)
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
@@ -406,6 +436,7 @@ class CudaPlatformBase(Platform):
             kv_cache_dtype=attn_selector_config.kv_cache_dtype,
             use_non_causal=attn_selector_config.use_non_causal,
             head_size=attn_selector_config.head_size,
+            qk_rope_head_dim=attn_selector_config.qk_rope_head_dim,
         )
         for priority, backend in enumerate(backend_priorities):
             try:

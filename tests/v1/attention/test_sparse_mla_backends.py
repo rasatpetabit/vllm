@@ -2035,8 +2035,11 @@ def test_task12_auto_selection_sm80_head576_preserves_dsv4(selection_vllm_config
 
 
 def test_task12_backend_priority_order_512_vs_576():
-    """SM90 sparse is preferred FIRST for 512 (glm5next NoPE) and LAST for
-    576 (DSV4), so DSV4's existing sparse preference order is preserved."""
+    """Declaration-derived ordering (design rev 7 4.4): the former
+    head-size-512 identity branch is gone; with the current declarations
+    (Triton sparse and FlashInfer SM90 both serve NoPE and rope) no exact
+    specialist exists, so the sparse tail is platform-ordered identically
+    for both geometries and the SM90 entry stays the fallback (last)."""
     from vllm.platforms.cuda import _get_backend_priorities
 
     p512 = [
@@ -2061,13 +2064,13 @@ def test_task12_backend_priority_order_512_vs_576():
             head_size=576,
         )
     ]
-    # 512: SM90 sparse before FlashAttn/FlashMLA/Triton sparse (preferred).
-    assert p512.index("FLASHINFER_MLA_SPARSE_SM90") < p512.index(
-        "TRITON_MLA_SPARSE"
-    )
-    # 576: SM90 sparse AFTER the reference DSV4 tail (fallback, not a
-    # preference change). Both keep the dense head identical.
+    # Both geometries: SM90 sparse AFTER the reference tail (fallback, not
+    # a preference); an exact layout specialist would be promoted ahead,
+    # but none is declared today.
+    assert p512[-1] == "FLASHINFER_MLA_SPARSE_SM90"
     assert p576[-1] == "FLASHINFER_MLA_SPARSE_SM90"
+    # and the two tails are identical (no identity branch remains).
+    assert p512[4:] == p576[4:]
     dense_head = [
         "FLASH_ATTN_MLA",
         "FLASHMLA",

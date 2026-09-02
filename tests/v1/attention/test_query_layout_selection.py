@@ -229,3 +229,70 @@ def test_layout_mismatch_is_a_structured_rejection() -> None:
     assert layout_reasons, reasons
     assert "NOPE_ONLY" in layout_reasons[0]
     assert "ROPE" in layout_reasons[0]
+
+
+# ---------------------------------------------------------------------------
+# Platform tail-ordering tables (design rev 7 4.4: complete expected ordered
+# sparse tails for sm80 and sm90 with both 512 NoPE and 576 rope geometries).
+# Runs where the platform chain imports; skips on hosts without it.
+# ---------------------------------------------------------------------------
+pytestmark_platform = pytest.mark.skipif(
+    not _BACKENDS_IMPORTABLE, reason=f"platform chain not importable: {_IMPORT_REASON}"
+)
+
+
+@pytest.mark.skipif(not _BACKENDS_IMPORTABLE, reason="platform chain not importable")
+@pytest.mark.parametrize(
+    ("capability", "head_size", "rope_dim", "expected_tail"),
+    [
+        # sm80, 512 (NoPE — glm5next): capability rejects FlashAttn/FlashMLA
+        # sparse; the tail order is platform order (no exact specialist with
+        # the current declarations).
+        (
+            "sm80",
+            512,
+            0,
+            ["FLASH_ATTN_MLA_SPARSE", "FLASHMLA_SPARSE", "TRITON_MLA_SPARSE", "FLASHINFER_MLA_SPARSE_SM90"],
+        ),
+        # sm80, 576 (rope — DSV4): identical platform order.
+        (
+            "sm80",
+            576,
+            64,
+            ["FLASH_ATTN_MLA_SPARSE", "FLASHMLA_SPARSE", "TRITON_MLA_SPARSE", "FLASHINFER_MLA_SPARSE_SM90"],
+        ),
+        # sm90, 512 (NoPE): the removed FlashInfer-first special case is gone;
+        # the order is platform-derived (documented behavior change: with both
+        # Triton and FlashInfer-SM90 declared general, no specialist exists).
+        (
+            "sm90",
+            512,
+            0,
+            ["FLASH_ATTN_MLA_SPARSE", "FLASHMLA_SPARSE", "TRITON_MLA_SPARSE", "FLASHINFER_MLA_SPARSE_SM90"],
+        ),
+        # sm90, 576 (rope): unchanged from the historical platform order.
+        (
+            "sm90",
+            576,
+            64,
+            ["FLASH_ATTN_MLA_SPARSE", "FLASHMLA_SPARSE", "TRITON_MLA_SPARSE", "FLASHINFER_MLA_SPARSE_SM90"],
+        ),
+    ],
+)
+def test_sparse_tail_ordering_tables(capability, head_size, rope_dim, expected_tail) -> None:
+    from vllm.platforms.cuda import _get_backend_priorities
+    from vllm.platforms.interface import DeviceCapability
+
+    cap = {"sm80": DeviceCapability(8, 0), "sm90": DeviceCapability(9, 0)}[capability]
+    priorities = _get_backend_priorities(
+        use_mla=True,
+        device_capability=cap,
+        num_heads=None,
+        kv_cache_dtype=None,
+        use_non_causal=False,
+        head_size=head_size,
+        qk_rope_head_dim=rope_dim,
+    )
+    names = [b.name for b in priorities]
+    tail = [n for n in names if n.endswith("_MLA_SPARSE") or n.endswith("_SM90")]
+    assert tail == expected_tail, (names, tail)
