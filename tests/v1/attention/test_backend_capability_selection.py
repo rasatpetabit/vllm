@@ -11,6 +11,7 @@ be imported (no compiled ops / disabled triton).
 """
 
 import pytest
+import torch
 
 from vllm.platforms.interface import DeviceCapability
 
@@ -72,3 +73,27 @@ def test_base_default_stays_true() -> None:
     assert AttentionBackend.supports_compute_capability(SM80) is True
     assert AttentionBackend.supports_compute_capability(SM90) is True
     assert AttentionBackend.supports_compute_capability(SM100) is True
+
+
+def test_capability_reason_appears_exactly_once() -> None:
+    """Design rev 7 section 4.4 (one capability check): a capability-rejected
+    backend's invalid_reasons carry the capability reason code exactly once —
+    the de345ac04d duplicate check is collapsed to the single detailed one.
+    Runs where the backend chain imports (in-image at T26; skips on hosts
+    without the compiled ops)."""
+    reasons = FlashMLASparseBackend.validate_configuration(
+        head_size=576,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=64,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=True,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=SM80,
+        attn_type="decoder",
+    )
+    cap_reasons = [r for r in reasons if "compute capability" in r]
+    assert len(cap_reasons) == 1, reasons
+    assert "8.0" in cap_reasons[0], "the surviving reason names the capability value"

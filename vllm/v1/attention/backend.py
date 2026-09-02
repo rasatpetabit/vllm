@@ -312,8 +312,6 @@ class AttentionBackend(ABC):
                 invalid_reasons.append("non-sparse not supported")
         if use_per_head_quant_scales and not cls.supports_per_head_quant_scales():
             invalid_reasons.append("per-head quant scales not supported")
-        if not cls.supports_compute_capability(device_capability):
-            invalid_reasons.append("compute capability not supported")
         if not cls.supports_attn_type(attn_type):
             invalid_reasons.append(f"attention type {attn_type} not supported")
         if has_sliding_window and not cls.supports_sliding_window():
