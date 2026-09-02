@@ -23,7 +23,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
-    is_deep_gemm_supported,
+    select_indexer_logits_path,
     native_next_n_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
@@ -1483,7 +1483,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # Schedule the sharded rows, not the batch: this is the work
             # decomposition for the very call the shard narrows.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and is_deep_gemm_supported():
+            # the ONE shared selector (design rev 7 4.4): same function the
+            # kpool indexer layer uses; the structured record is emitted once
+            _indexer_path, _ = select_indexer_logits_path()
+            if current_platform.is_cuda() and _indexer_path == "deepgemm":
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens
                     if decode_shard_bounds is None

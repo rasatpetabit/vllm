@@ -115,6 +115,29 @@ def is_deep_gemm_supported() -> bool:
     return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
 
 
+def select_indexer_logits_path() -> tuple[str, dict[str, bool]]:
+    """The ONE shared indexer-logits path selector (design rev 7 4.4).
+
+    Returns ``(path, predicate)`` with path in {"deepgemm", "triton"} and
+    the predicate components the decision rested on (env flag, deep_gemm
+    import availability, platform support) — the components of
+    ``is_deep_gemm_supported()`` (the predicate itself is unchanged).
+    Emits the structured ``indexer-selection/v1`` record the receipt
+    builder collects.
+    """
+    import json
+
+    predicate = {
+        "env": bool(envs.VLLM_USE_DEEP_GEMM),
+        "has_deep_gemm": bool(has_deep_gemm()),
+        "platform_supports": bool(current_platform.support_deep_gemm()),
+    }
+    path = "deepgemm" if is_deep_gemm_supported() else "triton"
+    record = {"schema": "indexer-selection/v1", "path": path, "predicate": predicate}
+    logger.info("INDEXER_SELECTION %s", json.dumps(record, sort_keys=True))
+    return path, predicate
+
+
 @functools.cache
 def is_deep_gemm_e8m0_used() -> bool:
     """Return `True` if vLLM is configured to use DeepGEMM "

@@ -22,7 +22,7 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm, is_deep_gemm_supported
+from vllm.utils.deep_gemm import has_deep_gemm, select_indexer_logits_path
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -293,9 +293,10 @@ def sparse_attn_indexer_kpool(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
-    # no DeepGEMM on SM80/SM120/SM121; the Triton MQA-logits fallback below
-    # serves those arches (mirrors the dsv4 indexer fallback).
-    use_deep_gemm = is_deep_gemm_supported()
+    # the ONE shared selector (design rev 7 4.4): path + predicate record
+    # (indexer-selection/v1); the dsv4 indexer uses the same function.
+    _indexer_path, _indexer_predicate = select_indexer_logits_path()
+    use_deep_gemm = _indexer_path == "deepgemm"
     if not use_deep_gemm:
         assert not use_fp4_cache, "Triton fallback does not support FP4 KV cache"
 

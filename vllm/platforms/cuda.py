@@ -438,6 +438,13 @@ class CudaPlatformBase(Platform):
             head_size=attn_selector_config.head_size,
             qk_rope_head_dim=attn_selector_config.qk_rope_head_dim,
         )
+        from vllm.v1.attention.backends.mla.query_layout import query_layout_for
+
+        requested_layout = (
+            query_layout_for(attn_selector_config.qk_rope_head_dim).value
+            if attn_selector_config.use_mla
+            else None
+        )
         for priority, backend in enumerate(backend_priorities):
             try:
                 backend_class = _get_attn_backend_class(backend)
@@ -457,6 +464,35 @@ class CudaPlatformBase(Platform):
                     _BackendCandidate(backend_class, backend, priority)
                 )
 
+        # Structured selection evidence (design rev 7 4.4): ONE JSON record
+        # per selection — the highest-priority valid backend as `selected`,
+        # every rejected candidate with its reason codes. The receipt builder
+        # collects these records from the engine log (zero records, malformed
+        # records, or conflicting selections across layer groups fail it).
+        import json as _json
+
+        logger.info(
+            "ATTN_SELECTION %s",
+            _json.dumps(
+                {
+                    "schema": "attn-selection/v1",
+                    "layer_group": "mla" if attn_selector_config.use_mla else "dense",
+                    "head_size": attn_selector_config.head_size,
+                    "query_layout": requested_layout,
+                    "capability": f"{device_capability.major}.{device_capability.minor}",
+                    "selected": (
+                        valid_backends_priorities[0].backend.name
+                        if valid_backends_priorities
+                        else None
+                    ),
+                    "rejected": [
+                        {"backend": backend.name, "reason_codes": list(reasons)}
+                        for backend, (_prio, reasons) in invalid_reasons.items()
+                    ],
+                },
+                sort_keys=True,
+            ),
+        )
         return valid_backends_priorities, invalid_reasons
 
     @classmethod
