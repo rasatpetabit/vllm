@@ -510,8 +510,10 @@ def fp8_mqa_logits_triton(
         weights:      [M, H] float32
         cu_seqlen_ks: [M] int32
         cu_seqlen_ke: [M] int32
-        clean_logits: when False, skip the -inf pre-fill of the output
-            (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
+        clean_logits: accepted for DeepGEMM signature parity only. This
+            implementation writes every row element (in-window logits,
+            explicit -inf outside `[ks, ke)`), so the flag does not change
+            the returned tensor.
     Returns:
         logits:       [M, N] float32
     """

@@ -59,13 +59,15 @@ def _reference_logits(q, k_fp8, scales, weights, ks, ke):
     k_deq = k_fp8.float()
     m, num_heads, head_dim = q_deq.shape
     n = k_deq.shape[0]
-    out = torch.full((m, n), float("-inf"), dtype=torch.float32)
+    out = torch.full((m, n), float("-inf"), dtype=torch.float32, device=q.device)
     k_scaled = k_deq * scales[:, None]
     for i in range(m):
-        window = k_scaled[ks[i] : ke[i]]
+        ks_i = int(ks[i].item())
+        ke_i = int(ke[i].item())
+        window = k_scaled[ks_i:ke_i]
         # [H, D] x [D, W] -> [H, W]
         dots = q_deq[i] @ window.t()
-        out[i, ks[i] : ke[i]] = (dots * weights[i][:, None]).sum(dim=0)
+        out[i, ks_i:ke_i] = (dots * weights[i][:, None]).sum(dim=0)
     return out
 
 
@@ -89,7 +91,7 @@ def test_kpool_mqa_logits_matches_reference(seed, m, n, num_heads, head_dim, k) 
         ke,
         clean_logits=True,
     ).float()
-    ref = _reference_logits(q, k_fp8, scales, weights, ks, ke).cuda()
+    ref = _reference_logits(q, k_fp8, scales, weights, ks, ke)
 
     assert got.shape == ref.shape == (m, n)
     finite = torch.isfinite(ref)
@@ -134,7 +136,7 @@ def test_kpool_clean_logits_is_parity_only_output_fully_determined() -> None:
     for i in range(got_clean.shape[0]):
         row = got_clean[i]
         w = slice(int(ks[i]), int(ke[i]))
-        outside = torch.ones(row.shape[0], dtype=torch.bool)
+        outside = torch.ones(row.shape[0], dtype=torch.bool, device=row.device)
         outside[w] = False
         assert torch.all(row[outside] == float("-inf")), (
             f"row {i}: outside-window elements must be -inf (fully-determined output)"
